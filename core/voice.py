@@ -38,6 +38,33 @@ def init_engine():
 # Global flag to check if Jarvis is speaking
 is_speaking = False
 
+
+def _extract_best_transcript(raw_result) -> str:
+    """Pick the most confident transcript from recognize_google(show_all=True)."""
+    if not isinstance(raw_result, dict):
+        return ""
+
+    alternatives = raw_result.get("alternative", [])
+    if not alternatives:
+        return ""
+
+    best_text = ""
+    best_score = -1.0
+    for alt in alternatives:
+        transcript = (alt.get("transcript") or "").strip()
+        if not transcript:
+            continue
+        confidence = alt.get("confidence")
+        if confidence is None:
+            confidence = 0.55
+        # Slightly favor longer candidates when confidence is tied.
+        score = float(confidence) + (min(len(transcript), 80) / 1000.0)
+        if score > best_score:
+            best_score = score
+            best_text = transcript
+
+    return best_text
+
 def _clean_for_speech(text: str) -> str:
     """Convert text to a clean, speakable string."""
     if not text:
@@ -134,45 +161,53 @@ def listen():
 
     r = sr.Recognizer()
     r.dynamic_energy_threshold = True
-    r.energy_threshold = 250
-    r.pause_threshold = 0.9
-    r.non_speaking_duration = 0.5
-    r.operation_timeout = 8
+    r.dynamic_energy_adjustment_damping = 0.2
+    r.dynamic_energy_ratio = 1.7
+    r.energy_threshold = int(os.environ.get("JARVIS_ENERGY_THRESHOLD", "220"))
+    r.pause_threshold = 0.75
+    r.phrase_threshold = 0.25
+    r.non_speaking_duration = 0.35
+    r.operation_timeout = 10
 
     with sr.Microphone() as source:
         print("Listening...")
         try:
-            r.adjust_for_ambient_noise(source, duration=1.0)
+            r.adjust_for_ambient_noise(source, duration=1.2)
         except Exception:
             pass
 
-        # Retry a couple of times to reduce missed commands in noisy environments
-        for _ in range(2):
+        # Retry with progressively larger listen windows for noisy/slow speech.
+        listen_profiles = [
+            {"timeout": 5, "phrase_time_limit": 8},
+            {"timeout": 7, "phrase_time_limit": 12},
+            {"timeout": 8, "phrase_time_limit": 15},
+        ]
+
+        for profile in listen_profiles:
             try:
-                audio = r.listen(source, timeout=6, phrase_time_limit=10)
+                audio = r.listen(
+                    source,
+                    timeout=profile["timeout"],
+                    phrase_time_limit=profile["phrase_time_limit"],
+                )
                 print("Recognizing...")
 
-                # Ask for alternatives and pick the best hypothesis when available
                 raw_result = r.recognize_google(audio, show_all=True)
-                if isinstance(raw_result, dict) and raw_result.get("alternative"):
-                    alternatives = raw_result.get("alternative", [])
-                    best = alternatives[0].get("transcript", "")
-                    best_conf = alternatives[0].get("confidence", 0.0)
-                    for alt in alternatives:
-                        conf = alt.get("confidence", 0.0)
-                        if conf > best_conf:
-                            best_conf = conf
-                            best = alt.get("transcript", best)
-                    if best:
-                        return best.lower().strip()
+                best = _extract_best_transcript(raw_result)
+                if best:
+                    return best.lower().strip()
 
-                # Fallback path
-                query = r.recognize_google(audio)
-                return query.lower().strip()
+                fallback = r.recognize_google(audio)
+                if fallback:
+                    return fallback.lower().strip()
 
             except sr.UnknownValueError:
+                # Reduce threshold slightly after misses to catch softer speech.
+                r.energy_threshold = max(120, int(r.energy_threshold * 0.9))
                 continue
             except sr.WaitTimeoutError:
+                continue
+            except sr.RequestError:
                 continue
             except Exception:
                 continue

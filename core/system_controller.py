@@ -12,6 +12,7 @@ class SystemController:
     def __init__(self) -> None:
         self.os_name = self._detect_os()
         self.pending_action: Optional[Dict[str, Any]] = None
+        self.pending_file_choices: Optional[Dict[str, Any]] = None
 
     def _detect_os(self) -> str:
         if os.name == "nt":
@@ -28,6 +29,11 @@ class SystemController:
         if self.pending_action:
             return self._handle_confirmation(command)
 
+        if self.pending_file_choices:
+            pending_choice_result = self._handle_pending_file_choice(command)
+            if pending_choice_result:
+                return pending_choice_result
+
         parsed = self._parse_command(command)
         if parsed["status"] == "failed":
             return parsed
@@ -42,6 +48,74 @@ class SystemController:
             )
 
         return self._execute(parsed)
+
+    def _handle_pending_file_choice(self, command: str) -> Optional[Dict[str, Any]]:
+        if not self.pending_file_choices:
+            return None
+
+        normalized = command.lower().strip()
+        if normalized in {"cancel", "stop", "nevermind", "no"}:
+            self.pending_file_choices = None
+            return self._response("open_file", "cancelled", "failed", "Selection cancelled.")
+
+        idx = self._parse_choice_index(normalized)
+        if idx is None:
+            # If user started a fresh command, drop stale pending choices and continue normal parse flow.
+            if re.match(r"^(open|launch|play|search|find|create|delete|rename|move|copy|run|execute)\b", normalized):
+                self.pending_file_choices = None
+                return None
+
+            choices = self.pending_file_choices.get("matches", [])
+            limit = len(choices)
+            return self._response(
+                "open_file",
+                "clarification_required",
+                "failed",
+                f"Please say open first one, open second one, or open number 1 to {limit}.",
+            )
+
+        choices = self.pending_file_choices.get("matches", [])
+        if not choices:
+            self.pending_file_choices = None
+            return self._response("open_file", "open_file", "failed", "No pending file choices found.")
+
+        if idx < 1 or idx > len(choices):
+            return self._response(
+                "open_file",
+                "clarification_required",
+                "failed",
+                f"Please choose a number between 1 and {len(choices)}.",
+            )
+
+        target = choices[idx - 1]
+        self.pending_file_choices = None
+        try:
+            os.startfile(str(target))
+            return self._response("open_file", "open_file", "success", f"Opened {target.name} from location {idx}.")
+        except Exception as exc:
+            return self._response("open_file", "open_file", "failed", f"Found {target.name} but could not open it: {exc}")
+
+    def _parse_choice_index(self, normalized: str) -> Optional[int]:
+        number_match = re.search(r"(?:number\s+)?(\d{1,2})", normalized)
+        if number_match and re.search(r"\b(open|choose|select|pick|play|launch)\b", normalized):
+            return int(number_match.group(1))
+
+        ordinal_map = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+        }
+        for word, idx in ordinal_map.items():
+            if re.search(rf"\b{word}\b", normalized) and re.search(r"\b(open|choose|select|pick|play|launch)\b", normalized):
+                return idx
+        return None
 
     def _handle_confirmation(self, command: str) -> Dict[str, Any]:
         normalized = command.lower().strip()
@@ -279,6 +353,17 @@ class SystemController:
             target = open_match.group(2).strip()
             target_lower = target.lower()
 
+            open_file_phrase = re.match(r"^file\s+(.+)$", target, flags=re.IGNORECASE)
+            if open_file_phrase:
+                explicit_file_query = open_file_phrase.group(1).strip().strip("\"'")
+                return {
+                    "intent": "open_file",
+                    "action": "open_file",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"query": explicit_file_query},
+                }
+
             # Support folder opening commands like "open desktop folder"
             folder_open_match = re.match(r"^(desktop|documents|downloads|videos|music|pictures)\s+folder$", target_lower)
             if folder_open_match:
@@ -391,6 +476,16 @@ class SystemController:
                     "status": "success",
                     "dangerous": False,
                     "params": {"url": url},
+                }
+
+            # If user explicitly asks for a likely file/media name, prioritize file search.
+            if self._looks_like_file_query(target):
+                return {
+                    "intent": "open_file",
+                    "action": "open_file",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"query": target},
                 }
             
             return {
@@ -692,11 +787,26 @@ class SystemController:
         return self._response("create_text_file", "create_text_file", "success", f"Created text file {target.name} on Desktop.")
 
     def _open_file(self, query: str) -> Dict[str, Any]:
-        matches = self._find_files(query, limit=10)
+        matches = self._find_files(query, limit=30)
         if not matches:
             return self._response("open_file", "open_file", "failed", f"I could not find {query} on this computer.")
 
-        target = self._pick_best_media_match(matches, query)
+        exact_same_name = self._same_name_matches(matches, query)
+        if len(exact_same_name) > 1:
+            joined = self._format_numbered_paths(exact_same_name)
+            self.pending_file_choices = {"matches": exact_same_name, "query": query}
+            return self._response(
+                "open_file",
+                "open_file",
+                "failed",
+                f"I found multiple files named {exact_same_name[0].name}.\n{joined}\nSay open first one, open second one, or open number 1.",
+            )
+
+        if len(exact_same_name) == 1:
+            target = exact_same_name[0]
+        else:
+            target = self._pick_best_media_match(matches, query)
+
         try:
             os.startfile(str(target))
             return self._response("open_file", "open_file", "success", f"Opened {target.name}.")
@@ -708,24 +818,58 @@ class SystemController:
         if not target_folder or not target_folder.exists() or not target_folder.is_dir():
             return self._response("open_file_in_folder", "open_file_in_folder", "failed", f"I could not find the folder {folder_name}.")
 
-        matches: List[Path] = []
+        file_matches: List[Path] = []
+        folder_matches: List[Path] = []
         query_lower = query.lower().strip()
         for current_root, dirs, files in os.walk(target_folder, topdown=True):
             dirs[:] = [d for d in dirs if d.lower() not in {".git", "__pycache__", "node_modules"}]
+
+            for dirname in dirs:
+                if query_lower in dirname.lower():
+                    folder_matches.append(Path(current_root) / dirname)
+                    if len(folder_matches) >= 10:
+                        break
+
             for filename in files:
                 if query_lower in filename.lower():
-                    matches.append(Path(current_root) / filename)
-                    if len(matches) >= 10:
+                    file_matches.append(Path(current_root) / filename)
+                    if len(file_matches) >= 15:
                         break
-            if len(matches) >= 10:
+            if len(file_matches) >= 15 and len(folder_matches) >= 10:
                 break
 
-        if not matches:
+        # Folder-first: if the requested item is a folder inside the folder, open it.
+        if folder_matches:
+            chosen_folder = self._pick_best_media_match(folder_matches, query)
+            try:
+                os.startfile(str(chosen_folder))
+                return self._response(
+                    "open_file_in_folder",
+                    "open_file_in_folder",
+                    "success",
+                    f"Opened folder {chosen_folder.name} inside {folder_name}.",
+                )
+            except Exception as exc:
+                return self._response(
+                    "open_file_in_folder",
+                    "open_file_in_folder",
+                    "failed",
+                    f"Found folder {chosen_folder.name} in {folder_name}, but could not open it: {exc}",
+                )
+
+        if not file_matches:
             # If query is generic (movie/video/song), pick the most recent media file in the folder.
-            generic_media_words = {"movie", "video", "song", "audio", "music", "file", "latest movie", "latest video"}
+            generic_media_words = {
+                "movie", "video", "song", "audio", "music", "file", "latest movie", "latest video",
+                "pdf", "image", "photo", "document", "doc", "presentation", "ppt", "spreadsheet", "excel",
+            }
             if query_lower in generic_media_words:
                 media_matches: List[Path] = []
-                media_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a"}
+                media_exts = {
+                    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a",
+                    ".pdf", ".txt", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+                    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+                }
                 for current_root, dirs, files in os.walk(target_folder, topdown=True):
                     dirs[:] = [d for d in dirs if d.lower() not in {".git", "__pycache__", "node_modules"}]
                     for filename in files:
@@ -749,9 +893,20 @@ class SystemController:
                             f"Found {target.name} in {folder_name}, but could not open it: {exc}",
                         )
 
-            return self._response("open_file_in_folder", "open_file_in_folder", "failed", f"I found {folder_name}, but no file matched {query}.")
+            return self._response("open_file_in_folder", "open_file_in_folder", "failed", f"I found {folder_name}, but no item matched {query}.")
 
-        target = self._pick_best_media_match(matches, query)
+        exact_same_name = self._same_name_matches(file_matches, query)
+        if len(exact_same_name) > 1:
+            joined = self._format_numbered_paths(exact_same_name)
+            self.pending_file_choices = {"matches": exact_same_name, "query": query}
+            return self._response(
+                "open_file_in_folder",
+                "open_file_in_folder",
+                "failed",
+                f"I found multiple files named {exact_same_name[0].name} in {folder_name}.\n{joined}\nSay open first one, open second one, or open number 1.",
+            )
+
+        target = exact_same_name[0] if len(exact_same_name) == 1 else self._pick_best_media_match(file_matches, query)
         try:
             os.startfile(str(target))
             return self._response(
@@ -967,6 +1122,39 @@ class SystemController:
             scored.append((score, path))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
+
+    def _same_name_matches(self, matches: List[Path], query: str) -> List[Path]:
+        normalized_query = (query or "").strip().strip("\"'").lower()
+        if not normalized_query:
+            return []
+
+        query_path = Path(normalized_query)
+        has_ext = bool(query_path.suffix)
+        if has_ext:
+            return [p for p in matches if p.name.lower() == query_path.name.lower()]
+        return [p for p in matches if p.stem.lower() == query_path.stem.lower()]
+
+    def _format_numbered_paths(self, paths: List[Path]) -> str:
+        lines = [f"{idx}. {path}" for idx, path in enumerate(paths, start=1)]
+        return "\n".join(lines)
+
+    def _looks_like_file_query(self, text: str) -> bool:
+        target = (text or "").strip().lower()
+        if not target:
+            return False
+
+        # Has extension-like suffix.
+        if re.search(r"\.[a-z0-9]{2,5}$", target):
+            return True
+
+        file_hint_words = {
+            "file", "folder", "pdf", "image", "photo", "movie", "video", "song", "audio",
+            "document", "doc", "ppt", "excel", "spreadsheet", "txt",
+        }
+        if any(word in target for word in file_hint_words):
+            return True
+
+        return False
 
     def _unique_path(self, base: Path, name: str, is_file: bool) -> Path:
         candidate = base / name

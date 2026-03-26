@@ -23,6 +23,7 @@ class JarvisEngine:
             "Never output JSON in normal responses. "
             "If the user asks for code, provide short runnable code directly. "
             "For factual questions, rely on the web context provided to you when available, otherwise answer from your knowledge. "
+            "For 'who is' questions, answer in identity format: '<Name> is <role or description>.' "
             "After using a tool, give a SHORT spoken confirmation, e.g. 'Done, I opened Telegram for you.' or 'I found the file and opened it.' "
             "If a tool returns an error, explain it simply in one sentence. "
             "Keep all responses under 2 sentences. Be natural and conversational like a voice assistant."
@@ -86,6 +87,120 @@ class JarvisEngine:
         action_words = ("open", "play", "launch", "search", "create", "delete", "run", "execute")
         return not any(word in q for word in action_words)
 
+    def _is_datetime_question(self, text: str) -> bool:
+        q = self._normalize_prompt_for_routing(text).lower()
+        if not q:
+            return False
+        datetime_patterns = [
+            r"\bwhat(?:'s| is)?\s+the\s+(?:date|time)\b",
+            r"\bcurrent\s+(?:date|time)\b",
+            r"\b(today'?s\s+date|time\s+now|date\s+and\s+time)\b",
+            r"\bwhat\s+time\s+is\s+it\b",
+            r"\bwhat\s+is\s+today\b",
+        ]
+        return any(re.search(p, q) for p in datetime_patterns)
+
+    def _is_weather_question(self, text: str) -> bool:
+        q = self._normalize_prompt_for_routing(text).lower()
+        if not q:
+            return False
+        return bool(re.search(r"\b(weather|temperature|forecast|rain|humidity|climate)\b", q))
+
+    def _extract_weather_location(self, text: str) -> str | None:
+        q = self._normalize_prompt_for_routing(text)
+        if not q:
+            return None
+
+        match = re.search(r"\b(?:in|at|for)\s+([a-zA-Z\s]+)$", q, flags=re.IGNORECASE)
+        if match:
+            location = match.group(1).strip(" ?.,")
+            if location and len(location) >= 2:
+                return location
+        return None
+
+    def _call_tool(self, tool_name: str, **kwargs):
+        tool_fn = self.registry.get_function(tool_name)
+        if not tool_fn:
+            return None
+        return tool_fn(**kwargs)
+
+    def _parse_tool_payload(self, raw_result) -> dict:
+        if isinstance(raw_result, dict):
+            return raw_result
+        if isinstance(raw_result, str):
+            try:
+                parsed = json.loads(raw_result)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            return {"status": "success", "message": raw_result}
+        return {"status": "failed", "message": "Invalid tool response."}
+
+    def _answer_datetime_query(self, prompt: str) -> str | None:
+        q = (prompt or "").lower()
+        wants_time = bool(re.search(r"\btime\b", q))
+        wants_date = bool(re.search(r"\bdate|today\b", q))
+
+        if wants_time and wants_date:
+            raw = self._call_tool("get_current_datetime")
+            payload = self._parse_tool_payload(raw)
+            if payload.get("status") == "success":
+                return f"Right now it is {payload.get('datetime', 'available now')}."
+            return payload.get("message", "I could not fetch the current date and time right now.")
+
+        if wants_time:
+            raw = self._call_tool("get_current_time")
+            payload = self._parse_tool_payload(raw)
+            if payload.get("status") == "success":
+                return f"The current time is {payload.get('time', 'available now')}."
+            return payload.get("message", "I could not fetch the current time right now.")
+
+        raw = self._call_tool("get_current_date")
+        payload = self._parse_tool_payload(raw)
+        if payload.get("status") == "success":
+            return f"Today's date is {payload.get('date', 'available now')}."
+        return payload.get("message", "I could not fetch today's date right now.")
+
+    def _answer_weather_query(self, prompt: str) -> str | None:
+        location = self._extract_weather_location(prompt)
+
+        if location:
+            raw = self._call_tool("get_weather", city=location)
+        else:
+            raw = self._call_tool("get_current_location_weather")
+
+        if raw is None:
+            return self._try_web_lookup_answer(prompt)
+
+        payload = self._parse_tool_payload(raw)
+        if payload.get("status") != "success":
+            # If default location is invalid/unavailable, try a stable fallback city.
+            if not location:
+                raw_fallback_city = self._call_tool("get_weather", city=os.environ.get("WEATHER_FALLBACK_CITY", "Mumbai"))
+                fallback_payload = self._parse_tool_payload(raw_fallback_city) if raw_fallback_city is not None else {}
+                if fallback_payload.get("status") == "success":
+                    payload = fallback_payload
+                else:
+                    fallback = self._try_web_lookup_answer(prompt)
+                    if fallback:
+                        return fallback
+                    return payload.get("message", "I could not fetch weather data right now.")
+            else:
+                fallback = self._try_web_lookup_answer(prompt)
+                if fallback:
+                    return fallback
+                return payload.get("message", "I could not fetch weather data right now.")
+
+        city = payload.get("city", location or "your location")
+        temp = payload.get("temperature", "not available")
+        cond = payload.get("conditions", "not available")
+        feels_like = payload.get("feels_like")
+
+        if feels_like:
+            return f"Current weather in {city} is {cond} with temperature {temp}, feels like {feels_like}."
+        return f"Current weather in {city} is {cond} with temperature {temp}."
+
     def _direct_answer_without_tools(self, user_prompt: str) -> str:
         try:
             today = date.today().strftime("%B %d, %Y")
@@ -98,7 +213,7 @@ class JarvisEngine:
                             f"Today's date is {today}. "
                             "Answer the user directly in one or two short sentences using your up-to-date knowledge. "
                             "Do not call tools. Do not output JSON. "
-                            "If the question asks 'who is', start with the person's name first. "
+                            "If the question asks 'who is' or 'who are', answer as '<Name> is <role or description>.' "
                             "If there are multiple formats (for example cricket formats), state that clearly in one sentence."
                         ),
                     },
@@ -106,9 +221,63 @@ class JarvisEngine:
                 ],
                 max_tokens=120,
             )
-            return (response.choices[0].message.content or "").strip() or "I could not find that right now."
+            raw_answer = (response.choices[0].message.content or "").strip() or "I could not find that right now."
+            return self._enforce_identity_answer_template(user_prompt, raw_answer)
         except Exception:
             return "I could not fetch that answer right now. Please try again."
+
+    def _enforce_identity_answer_template(self, question: str, answer: str) -> str:
+        q = self._normalize_prompt_for_routing(question).strip().lower()
+        text = (answer or "").strip()
+        if not text:
+            return answer
+
+        who_match = re.match(r"^who\s+(is|are)\s+(.+?)\??$", q)
+        if not who_match:
+            return answer
+
+        role = who_match.group(2).strip().rstrip("?.")
+        first_sentence = text.split(".")[0].strip()
+        if not first_sentence:
+            return answer
+        first_sentence = re.sub(r"^(and|also|however)\s+", "", first_sentence, flags=re.IGNORECASE).strip()
+
+        role_lower = role.lower()
+        # Precision rule for common leadership roles to avoid wrong leading entities.
+        if "prime minister" in role_lower:
+            pm_match = re.search(
+                r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+is\s+(?:the\s+)?prime minister\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if pm_match:
+                return f"{pm_match.group(1).strip()} is {role}."
+            if "narendra modi" in text.lower():
+                return f"Narendra Modi is {role}."
+
+        # Already in identity form, keep as-is.
+        if re.search(r"\b(is|are)\b", first_sentence, flags=re.IGNORECASE) and not first_sentence.lower().startswith(("the ", "a ", "an ")):
+            return first_sentence + "."
+
+        # Try to extract a likely person/entity name and force a spoken template.
+        candidates = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b", text)
+        if candidates:
+            stop_words = {
+                "The", "A", "An", "Prime", "Minister", "President", "Chief", "India", "United", "States",
+                "Source", "Wikipedia", "DuckDuckGo", "Google",
+            }
+            multi_word = [c.strip() for c in candidates if len(c.split()) >= 2]
+            filtered = [c for c in multi_word if c.split()[0] not in stop_words]
+            if not filtered:
+                filtered = [c.strip() for c in candidates if c.strip() not in stop_words]
+
+            if filtered:
+                name = filtered[-1]
+                if who_match.group(1) == "are":
+                    return f"{name} are {role}."
+                return f"{name} is {role}."
+
+        return first_sentence + "."
 
     def _direct_code_without_tools(self, user_prompt: str) -> str:
         q = (user_prompt or "").strip().lower()
@@ -157,12 +326,24 @@ class JarvisEngine:
                 if asks_winner and not any(k in answer.lower() for k in ("won", "winner", "champion")):
                     return None
 
+                asks_identity = bool(re.match(r"^who\s+is\b", q))
+                if asks_identity:
+                    # Reject definition-like snippets (common from search snippets) for identity queries.
+                    if answer.lower().startswith("the "):
+                        return None
+                    # Identity answers should contain at least one likely proper-name phrase.
+                    likely_names = re.findall(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", answer)
+                    if not likely_names:
+                        return None
+
                 # Keep answers short and speech-friendly.
                 short = answer.split(".")[0].strip()
                 if short:
                     answer = short + "."
                 if len(answer) > 220:
                     answer = answer[:217].rstrip() + "..."
+
+                answer = self._enforce_identity_answer_template(user_prompt, answer)
 
                 source = (payload.get("source") or "").strip()
                 if source:
@@ -209,6 +390,16 @@ class JarvisEngine:
         controller_result = self.controller.handle_command(normalized_prompt)
         if controller_result.get("intent") != "unknown" or controller_result.get("action") == "clarification_required":
             return json.dumps(controller_result)
+
+        if self._is_datetime_question(normalized_prompt):
+            datetime_answer = self._answer_datetime_query(normalized_prompt)
+            if datetime_answer:
+                return datetime_answer
+
+        if self._is_weather_question(normalized_prompt):
+            weather_answer = self._answer_weather_query(normalized_prompt)
+            if weather_answer:
+                return weather_answer
 
         if self._is_coding_request(normalized_prompt):
             return self._direct_code_without_tools(normalized_prompt)

@@ -1,5 +1,7 @@
 import webbrowser
 import json
+import os
+import re
 import urllib.parse
 import requests
 from typing import List, Dict, Any, Callable
@@ -129,43 +131,49 @@ class WebSkill(Skill):
             return json.dumps({"status": "failed", "message": "Please provide a question to look up."})
 
         headers = {"User-Agent": "JARVIS/1.0"}
+        lowered = query.lower()
 
-        # 1) Try Wikipedia search + summary for concise factual answers.
-        try:
-            search_resp = requests.get(
-                "https://en.wikipedia.org/w/api.php",
-                params={
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "format": "json",
-                    "utf8": 1,
-                    "srlimit": 1,
-                },
-                headers=headers,
-                timeout=6,
-            )
-            if search_resp.ok:
-                search_data = search_resp.json()
-                hits = search_data.get("query", {}).get("search", [])
-                if hits:
-                    title = hits[0].get("title", "").strip()
-                    if title:
-                        summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
-                        summary_resp = requests.get(summary_url, headers=headers, timeout=6)
-                        if summary_resp.ok:
-                            summary_data = summary_resp.json()
-                            extract = (summary_data.get("extract") or "").strip()
-                            if extract:
-                                return json.dumps({
-                                    "status": "success",
-                                    "answer": extract,
-                                    "source": f"Wikipedia: {title}",
-                                })
-        except Exception:
-            pass
+        def is_definition_query(text: str) -> bool:
+            patterns = [
+                r"^what\s+is\s+",
+                r"^define\s+",
+                r"\bmeaning\s+of\b",
+                r"\bhistory\s+of\b",
+                r"\bexplain\b",
+            ]
+            return any(re.search(p, text) for p in patterns)
 
-        # 2) Fallback to DuckDuckGo instant answers.
+        # 1) Google Custom Search API (if configured) for current factual questions.
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
+        google_cse_id = os.environ.get("GOOGLE_CSE_ID")
+        if google_api_key and google_cse_id:
+            try:
+                g_resp = requests.get(
+                    "https://www.googleapis.com/customsearch/v1",
+                    params={
+                        "key": google_api_key,
+                        "cx": google_cse_id,
+                        "q": query,
+                        "num": 3,
+                    },
+                    headers=headers,
+                    timeout=8,
+                )
+                if g_resp.ok:
+                    g_data = g_resp.json()
+                    items = g_data.get("items", [])
+                    if items:
+                        top = items[0]
+                        snippet = (top.get("snippet") or "").replace("\n", " ").strip()
+                        title = (top.get("title") or "").strip()
+                        link = (top.get("link") or "Google")
+                        if snippet:
+                            answer = f"{title}. {snippet}" if title and title.lower() not in snippet.lower() else snippet
+                            return json.dumps({"status": "success", "answer": answer, "source": link})
+            except Exception:
+                pass
+
+        # 2) DuckDuckGo instant answers.
         try:
             ddg_resp = requests.get(
                 "https://api.duckduckgo.com/",
@@ -187,6 +195,42 @@ class WebSkill(Skill):
                         return json.dumps({"status": "success", "answer": text, "source": "DuckDuckGo"})
         except Exception:
             pass
+
+        # 3) Wikipedia only for definition/explanation style questions.
+        if is_definition_query(lowered):
+            try:
+                search_resp = requests.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": query,
+                        "format": "json",
+                        "utf8": 1,
+                        "srlimit": 1,
+                    },
+                    headers=headers,
+                    timeout=6,
+                )
+                if search_resp.ok:
+                    search_data = search_resp.json()
+                    hits = search_data.get("query", {}).get("search", [])
+                    if hits:
+                        title = hits[0].get("title", "").strip()
+                        if title:
+                            summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
+                            summary_resp = requests.get(summary_url, headers=headers, timeout=6)
+                            if summary_resp.ok:
+                                summary_data = summary_resp.json()
+                                extract = (summary_data.get("extract") or "").strip()
+                                if extract:
+                                    return json.dumps({
+                                        "status": "success",
+                                        "answer": extract,
+                                        "source": f"Wikipedia: {title}",
+                                    })
+            except Exception:
+                pass
 
         return json.dumps({
             "status": "failed",
