@@ -1,0 +1,145 @@
+JARVIS Update Notes
+
+==============================
+March 14, 2026
+==============================
+
+What you asked to fix
+- Open Telegram desktop correctly (not download page)
+- Open Gmail/YouTube/WhatsApp properly
+- Access local files across laptop (movies, videos, docs, etc.)
+- Understand commands like:
+  - "open desktop folder"
+  - "open whatsapp in desktop"
+  - "youtube and play <song>"
+  - "open telegram desktop and play movie"
+- Create new folder / create text file commands
+- Better voice listening accuracy and retries
+- Speak response for each command (confirmation + result)
+
+What was updated
+1) core/system_controller.py
+- Added robust command parsing for natural spoken phrases
+- Added typo handling: "pen ..." -> "open ..."
+- Added open_folder intent (Desktop, Documents, Downloads, Videos, Music, Pictures)
+- Added YouTube play phrase handling (direct search URL)
+- Improved app target cleanup (for example, "in desktop" suffix)
+- Improved WhatsApp/Telegram handling
+- Added media play from Telegram Desktop folder
+- Expanded file search roots to home folders + available drives (C/D/E/F/G)
+- Added safer skip list for heavy/system directories
+
+2) skills/system_ops.py
+- Replaced macOS-style app opening with Windows-compatible behavior
+- Added app map and web fallbacks for common apps/sites
+
+3) skills/file_ops.py
+- Added open_local_file to find/open local files by partial name
+- Added open_folder and list_folder_contents
+- Improved support for video/audio/document/image search
+
+4) skills/web_ops.py
+- Added open_website and youtube_search
+- Added quick-site map (Gmail, YouTube, Telegram Web, WhatsApp Web, etc.)
+- Added graceful handling for missing site_name
+
+5) core/voice.py
+- Added _clean_for_speech() to convert JSON/markdown into natural spoken text
+- Improved speech recognition parameters
+- Added retry logic and better best-alternative selection for recognition
+
+6) core/engine.py
+- Updated assistant instruction to produce short, spoken-friendly confirmations
+- Ensures responses are suitable for text-to-speech
+
+How to run
+1) Open PowerShell in:
+   C:\Users\Abdul Aneef\Documents\voice assistant with file accessing
+
+2) Activate environment:
+   & "C:\Users\Abdul Aneef\Documents\voice assistant with file accessing\.venv-1\Scripts\Activate.ps1"
+
+3) Start JARVIS (voice mode):
+   cd "C:\Users\Abdul Aneef\Documents\voice assistant with file accessing\Project_JARVIS"
+   python main.py
+
+4) Optional text mode (for testing):
+   python main.py --text
+
+Quick test commands
+- open telegram
+- open gmail
+- youtube and play vadi pulla va
+- open desktop folder
+- open whatsapp in desktop
+- open telegram desktop and play movie
+- create a new folder
+- create new text file in home page
+- can you hear me
+
+
+==============================
+March 17, 2026
+==============================
+
+Today's date
+- March 17, 2026
+
+What was done today
+1) core/system_controller.py
+- Added patterns for file-in-folder commands:
+  - "open <file> in <folder> folder"
+  - "open <folder> folder and play <file>"
+  - "play movie/video/song in <folder> folder"
+- Added conversational local reply for:
+  - "can you speak"
+  - "do you speak"
+  - "can you talk"
+  - "do you talk"
+
+2) core/engine.py
+- Added date-aware instruction using today's date dynamically
+- Updated factual question routing to try live web lookup first for all factual questions
+- Added stronger time-sensitive detection for current roles/events (PM, president, captain, winner, champion, richest, rank, etc.)
+- Improved recovered tool-call argument filling so failed tool calls get proper fallback args from user prompt
+- Added prompt normalization to strip noisy prefixes like "Thinking:" and numbered prefixes like "2."
+- Added clearer Groq rate-limit message with parsed retry time (instead of generic brain error)
+
+3) skills/web_ops.py
+- Continued using web_lookup as the primary source for factual answers before model fallback
+
+4) skills/screenshot_ops.py
+- Replaced macOS-only screencapture logic with platform-specific capture
+- Added Windows screenshot support via PowerShell + .NET screen capture
+- Kept macOS and Linux fallback handling
+
+5) core/voice.py
+- Updated speech output path for reliability on Windows
+- Added Windows native SAPI speech fallback/primary path when pyttsx3 is silent
+- Kept pyttsx3 fallback path for cross-platform behavior
+
+6) main.py behavior confirmed
+- JARVIS prints and speaks responses in normal flow
+- Startup message is spoken: "Jarvis Online. Ready for your command."
+
+How to access and run
+1) Open PowerShell at:
+   C:\Users\Abdul Aneef\Documents\voice assistant with file accessing
+
+2) Activate venv:
+   & "C:\Users\Abdul Aneef\Documents\voice assistant with file accessing\.venv-1\Scripts\Activate.ps1"
+
+3) Start JARVIS (voice mode):
+   cd "C:\Users\Abdul Aneef\Documents\voice assistant with file accessing\Project_JARVIS"
+   python main.py
+
+4) Optional text mode:
+   python main.py --text
+
+Notes for tomorrow (pending verification/fix)
+- Re-check and finalize "access/open file inside a folder" behavior, because this was reported as not working in some cases
+- Test examples:
+  - "open movie in Movies folder"
+  - "open song in Music folder"
+  - "open report in Documents folder"
+

@@ -32,6 +32,42 @@ JARVIS is equipped with a diverse set of skills:
 - **System Operations**: Controls volume, screen brightness, and application management (`system_ops`).
 - **File Management**: Create, read, and organize files (`file_ops`).
 - **Context Awareness**: Tracks date, time, and maintains long-term memory (`memory_ops`, `datetime_ops`).
+- **System Controller Mode**: Deterministic command parsing with OS-aware execution, confirmation for dangerous actions, and structured JSON responses (`core/system_controller.py`).
+
+#### Safety & Confirmation Rules
+- JARVIS asks confirmation before destructive/sensitive actions (delete, shutdown/restart, uninstall/format-like requests).
+- JARVIS does not execute destructive operations until explicit `yes` confirmation.
+- Unclear system commands return clarification requests instead of guessing.
+- `run` / `execute` shell commands are restricted by a safe allowlist; out-of-policy commands are blocked.
+- Risky allowlisted shell commands require confirmation before execution.
+
+#### Structured Response Contract
+All system-controller actions return JSON in this format:
+
+```json
+{
+   "intent": "detected_intent",
+   "action": "executed_action",
+   "status": "success | failed | confirmation_required",
+   "message": "short human readable response"
+}
+```
+
+#### System Controller Examples
+- `Open WhatsApp`
+- `Create folder named Projects on Desktop`
+- `Delete file report.pdf` (asks confirmation)
+- `Search for budget file`
+- `Rename file old.txt to new.txt`
+- `Move file notes.txt to Documents`
+- `Copy file notes.txt to Desktop`
+- `Turn off wifi` (asks confirmation)
+- `Turn on bluetooth` (asks confirmation)
+- `Set volume to 40` (asks confirmation)
+- `Set brightness to 70` (asks confirmation)
+- `Shutdown system` (asks confirmation)
+- `Run command ipconfig /all`
+- `Execute tasklist`
 
 ## 🚀 Setup & Installation
 

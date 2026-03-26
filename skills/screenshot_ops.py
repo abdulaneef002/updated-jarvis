@@ -1,11 +1,13 @@
 import os
 import json
+import platform
+import subprocess
 from datetime import datetime
 from typing import List, Dict, Any, Callable
 from core.skill import Skill
 
 class ScreenshotSkill(Skill):
-    """Skill for taking screenshots on macOS."""
+    """Skill for taking screenshots on Windows/macOS/Linux."""
     
     def __init__(self):
         # Default screenshot directory
@@ -45,7 +47,7 @@ class ScreenshotSkill(Skill):
 
     def take_screenshot(self, filename: str = None) -> str:
         """
-        Take a screenshot using macOS screencapture command.
+        Take a screenshot using OS-specific methods.
         
         Args:
             filename: Optional custom filename (without extension)
@@ -65,9 +67,8 @@ class ScreenshotSkill(Skill):
             
             filepath = os.path.join(self.screenshot_dir, filename)
             
-            # Take screenshot using macOS screencapture
-            # -x: no sound, -C: capture cursor
-            result = os.system(f"screencapture -x '{filepath}'")
+            # Use native screenshot tooling per OS.
+            result = self._capture_with_platform_tool(filepath)
             
             if result == 0 and os.path.exists(filepath):
                 return json.dumps({
@@ -86,3 +87,32 @@ class ScreenshotSkill(Skill):
                 "status": "error",
                 "message": f"Screenshot error: {str(e)}"
             })
+
+    def _capture_with_platform_tool(self, filepath: str) -> int:
+        system = platform.system().lower()
+
+        if system == "windows":
+            ps_command = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "Add-Type -AssemblyName System.Drawing; "
+                "$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                "$bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height; "
+                "$gfx = [System.Drawing.Graphics]::FromImage($bmp); "
+                "$gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size); "
+                f"$bmp.Save('{filepath.replace("'", "''")}'); "
+                "$gfx.Dispose(); $bmp.Dispose();"
+            )
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+            )
+            return completed.returncode
+
+        if system == "darwin":
+            completed = subprocess.run(["screencapture", "-x", filepath], capture_output=True, text=True)
+            return completed.returncode
+
+        # Linux fallback (requires gnome-screenshot on most distros)
+        completed = subprocess.run(["gnome-screenshot", "-f", filepath], capture_output=True, text=True)
+        return completed.returncode

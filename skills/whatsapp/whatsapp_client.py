@@ -11,10 +11,10 @@ class WhatsAppClient:
         # We don't store driver here to avoid stale references
         pass
 
-    def send_message(self, phone_number, message):
+    def send_message(self, identifier, message):
         """
-        Sends a message to a specific phone number.
-        Optimized to use Search Bar if available to avoid full page reload.
+        Sends a message to a WhatsApp contact by name or phone number.
+        Uses search bar when possible; falls back to URL for phone numbers.
         """
         from selenium.webdriver.common.keys import Keys
         
@@ -23,33 +23,44 @@ class WhatsAppClient:
             driver = WhatsAppDriver.get_driver()
             wait = WebDriverWait(driver, 20)
             
-            # 0. Check if we are already on WhatsApp Web and loaded
+            # 0. Determine if identifier looks like a phone number
+            is_phone_number = identifier.strip().lstrip("+").isdigit()
+
+            # 1. Check if we are already on WhatsApp Web and loaded
             try:
                 if "web.whatsapp.com" in driver.current_url:
-                    # Validating if the search bar exists (Side panel)
-                    # Side panel search input usually has data-tab="3"
                     search_box = driver.find_element(By.XPATH, '//div[@contenteditable="true"][@data-tab="3"]')
-                    
+
                     print("WhatsApp already open. Using Search Bar for speed...")
                     search_box.clear()
-                    # We search by phone number to be precise
-                    search_box.send_keys(phone_number)
+                    search_box.send_keys(identifier)
                     search_box.send_keys(Keys.ENTER)
-                    
-                    # Giving it a moment to switch chat
+
                     time.sleep(1)
                 else:
                     raise Exception("Not on WhatsApp Web")
             except Exception:
-                # Fallback: Full URL load (Slower but reliable)
-                print("Navigating via URL...")
-                encoded_message = urllib.parse.quote(message) # This is ignored if we use search, but keeping logic structure
-                url = f"https://web.whatsapp.com/send?phone={phone_number}"
-                driver.get(url)
+                print("Opening WhatsApp Web...")
+                if is_phone_number:
+                    encoded_message = urllib.parse.quote(message)
+                    url = f"https://web.whatsapp.com/send?phone={identifier}&text={encoded_message}"
+                    driver.get(url)
+                else:
+                    driver.get("https://web.whatsapp.com")
 
-            # 2. Wait for Message Box
+            # 2. Ensure chat opens for name-based search
+            if not is_phone_number:
+                try:
+                    search_box = wait.until(EC.presence_of_element_located((By.XPATH, '//div[@contenteditable="true"][@data-tab="3"]')))
+                    search_box.clear()
+                    search_box.send_keys(identifier)
+                    search_box.send_keys(Keys.ENTER)
+                    time.sleep(1)
+                except TimeoutException:
+                    return "WhatsApp Web is not ready. Scan the QR code to sign in first."
+
+            # 3. Wait for Message Box
             print("Waiting for chat to load...")
-            # Message box is data-tab="10"
             textbox = wait.until(EC.presence_of_element_located((By.XPATH, '//div[@contenteditable="true"][@data-tab="10"]')))
             
             # Type message (if we used search, text isn't pre-filled)
@@ -82,11 +93,7 @@ class WhatsAppClient:
             # 4. Wait a bit for send to process
             time.sleep(1) 
             
-            return f"Message sent to {phone_number}"
-
-        except Exception as e:
-            print(f"Error in send_message: {e}")
-            return f"Failed to send message: {e}"
+            return f"Message sent to {identifier}"
 
         except Exception as e:
             print(f"Error in send_message: {e}")

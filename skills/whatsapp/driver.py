@@ -1,8 +1,9 @@
+import os
+from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
-import os
 
 class WhatsAppDriver:
     _instance = None
@@ -29,14 +30,32 @@ class WhatsAppDriver:
 
     @staticmethod
     def _init_driver():
-        print("Initializing Safari Driver...")
         try:
-            # Safari doesn't need webdriver_manager, it's built-in on macOS.
-            # You just need to enable 'Allow Remote Automation' in Safari > Develop menu.
-            driver = webdriver.Safari()
-            driver.maximize_window()
-            return driver
+            if os.name == "nt":
+                return WhatsAppDriver._init_chrome()
+            return WhatsAppDriver._init_safari()
         except Exception as e:
-            print(f"Failed to initialize Safari: {e}")
-            print("Ensure 'Allow Remote Automation' is enabled in Safari's Develop menu.")
+            print(f"Failed to initialize WhatsApp driver: {e}")
             raise e
+
+    @staticmethod
+    def _init_chrome():
+        print("Initializing Chrome Driver...")
+        options = Options()
+        options.add_argument("--start-maximized")
+
+        profile_dir = Path.home() / ".jarvis_whatsapp_profile"
+        options.add_argument(f"--user-data-dir={profile_dir}")
+
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+
+    @staticmethod
+    def _init_safari():
+        print("Initializing Safari Driver...")
+        # Safari doesn't need webdriver_manager, it's built-in on macOS.
+        # You just need to enable 'Allow Remote Automation' in Safari > Develop menu.
+        driver = webdriver.Safari()
+        driver.maximize_window()
+        return driver

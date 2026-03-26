@@ -16,17 +16,27 @@ class SkillRegistry:
             print(f"Skills directory not found: {skills_dir}")
             return
 
+        skip_env = os.environ.get("SKIP_SKILLS", "")
+        skip_list = {name.strip().lower() for name in skip_env.split(",") if name.strip()}
+
         for filename in os.listdir(skills_dir):
             if filename.endswith(".py") and filename != "__init__.py":
                 module_name = filename[:-3]
+                if module_name.lower() in skip_list:
+                    print(f"Skipping skill: {module_name}")
+                    continue
                 file_path = os.path.join(skills_dir, filename)
                 self._load_skill_from_file(module_name, file_path, context)
 
     def _load_skill_from_file(self, module_name: str, file_path: str, context: Dict[str, Any] = None):
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            try:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except Exception as e:
+                print(f"Failed to import skill module {module_name}: {e}")
+                return
             
             for name, obj in inspect.getmembers(module):
                 if inspect.isclass(obj) and issubclass(obj, Skill) and obj is not Skill:

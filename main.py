@@ -3,6 +3,7 @@ import sys
 import argparse
 import threading 
 import time
+import json
 from dotenv import load_dotenv
 from core.voice import speak, listen
 from core.registry import SkillRegistry
@@ -24,10 +25,7 @@ def jarvis_loop(pause_event, registry, args):
     # Initialize Engine
     jarvis = JarvisEngine(registry)
 
-    if args.text:
-        print("JARVIS: Jarvis Online. Ready for command (Text Mode).")
-    else:
-        speak("Jarvis Online. Ready for command.")
+    speak("Jarvis Online. Ready for your command.")
 
     while True:
         # Check for pause
@@ -37,7 +35,7 @@ def jarvis_loop(pause_event, registry, args):
 
         if args.text:
             try:
-                user_query = input("YOU: ").lower()
+                user_query = input("YOU: ")
             except EOFError:
                 break
         else:
@@ -47,27 +45,38 @@ def jarvis_loop(pause_event, registry, args):
         if pause_event.is_set():
             continue
 
-        if user_query == "none" or not user_query: continue
-        if "quit" in user_query: 
+        normalized_query = user_query.lower().strip()
+
+        if normalized_query == "none" or not normalized_query: continue
+        if "quit" in normalized_query: 
             print("Shutting down JARVIS loop...")
             # We can't easily kill the main thread (GUI) from here, 
             # but we can stop this loop. The user will have to close the GUI.
             speak("Shutting down.")
             break
         
-        # Wake word / Command filtering Logic
-        direct_commands = [
-            "open", "volume", "search", "create", "write", "read", "make",
-            "who", "what", "when", "where", "how", "why", "thank", "hello"
-        ]
-        
-        is_direct = any(cmd in user_query for cmd in direct_commands)
-        
-        if "jarvis" not in user_query and not is_direct:
-            print(f"Ignored: {user_query}")
-            continue
-            
-        clean_query = user_query.replace("jarvis", "").strip()
+        if args.text:
+            clean_query = normalized_query
+        else:
+            always_listen = os.environ.get("ALWAYS_LISTEN", "true").lower() in {"1", "true", "yes"}
+            if always_listen:
+                clean_query = normalized_query
+            else:
+                # Wake word / Command filtering Logic (voice mode only)
+                direct_commands = [
+                    "open", "volume", "search", "create", "write", "read", "make", "delete",
+                    "shutdown", "restart", "rename", "move", "copy", "run", "execute",
+                    "brightness", "wifi", "bluetooth",
+                    "who", "what", "when", "where", "how", "why", "thank", "hello"
+                ]
+                
+                is_direct = any(cmd in normalized_query for cmd in direct_commands)
+                
+                if "jarvis" not in normalized_query and not is_direct:
+                    print(f"Ignored: {user_query}")
+                    continue
+                    
+                clean_query = normalized_query.replace("jarvis", "").strip()
         
         try:
             print(f"Thinking: {clean_query}")
@@ -78,16 +87,20 @@ def jarvis_loop(pause_event, registry, args):
                 continue
 
             if response:
-                if args.text:
-                    print(f"JARVIS: {response}")
-                else:
-                    speak(response)
+                spoken_response = response
+                try:
+                    parsed = json.loads(response)
+                    spoken_response = parsed.get("message", response)
+                except Exception:
+                    pass
+
+                # Always speak, and speak() also prints the same line so user gets text + voice.
+                speak(spoken_response)
+            else:
+                speak("I heard you, but I could not generate a response. Please try again.")
         except Exception as e:
             print(f"Main Loop Error: {e}")
-            if args.text:
-                print("JARVIS: System error.")
-            else:
-                speak("System error.")
+            speak("System error. Please try again.")
 
 def main():
     parser = argparse.ArgumentParser(description="JARVIS AI Assistant")
