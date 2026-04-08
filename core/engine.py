@@ -13,21 +13,93 @@ class JarvisEngine:
         self.controller = SystemController()
         self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
         self.model_name = "llama-3.3-70b-versatile"
+        self.last_user_language = "en"
         
         today = date.today().strftime("%B %d, %Y")
-        self.system_instruction = (
+        self.system_instruction = self._build_system_instruction("en")
+
+    def _build_system_instruction(self, language: str) -> str:
+        today = date.today().strftime("%B %d, %Y")
+        if language == "ta":
+            language_rule = (
+                "Respond only in natural spoken Tamil written in Tamil script. "
+                "Do not mix English unless a technical term is required. "
+            )
+        else:
+            language_rule = "Respond in plain conversational English. "
+
+        return (
             f"You are Jarvis, a voice-controlled AI assistant running on Windows. "
             f"Today's date is {today}. Use this to answer any time-related questions accurately. "
-            "Your responses will be SPOKEN ALOUD by a text-to-speech engine, so always respond in plain conversational English. "
+            "Your responses will be SPOKEN ALOUD by a text-to-speech engine. "
+            f"{language_rule}"
             "NEVER use markdown formatting (no **, ##, -, *, backticks, bullet points). "
             "Never output JSON in normal responses. "
             "If the user asks for code, provide short runnable code directly. "
             "For factual questions, rely on the web context provided to you when available, otherwise answer from your knowledge. "
             "For 'who is' questions, answer in identity format: '<Name> is <role or description>.' "
-            "After using a tool, give a SHORT spoken confirmation, e.g. 'Done, I opened Telegram for you.' or 'I found the file and opened it.' "
+            "After using a tool, give a SHORT spoken confirmation. "
             "If a tool returns an error, explain it simply in one sentence. "
             "Keep all responses under 2 sentences. Be natural and conversational like a voice assistant."
         )
+
+    def _detect_user_language(self, text: str) -> str:
+        q = (text or "").strip().lower()
+        if not q:
+            return "en"
+
+        if re.search(r"[\u0B80-\u0BFF]", q):
+            return "ta"
+
+        tamil_romanized_markers = (
+            "vanakkam", "tamizh", "tamil", "ungal", "ennai", "epadi", "enna", "nandri"
+        )
+        if any(marker in q for marker in tamil_romanized_markers):
+            return "ta"
+
+        return "en"
+
+    def _translate_text(self, text: str, target_language: str) -> str:
+        if not text:
+            return text
+        if target_language != "ta":
+            return text
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Translate the given text to spoken Tamil in Tamil script. "
+                            "Keep meaning exact, concise, and do not add extra details. "
+                            "Return only the translated Tamil sentence."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=140,
+            )
+            translated = (response.choices[0].message.content or "").strip()
+            return translated or text
+        except Exception:
+            return text
+
+    def _localize_controller_result(self, controller_result: dict, language: str) -> str:
+        if language != "ta":
+            return json.dumps(controller_result)
+
+        localized = dict(controller_result)
+        message = str(localized.get("message") or "")
+        if message:
+            localized["message"] = self._translate_text(message, "ta")
+        return json.dumps(localized, ensure_ascii=False)
+
+    def _localize_plain_response(self, text: str, language: str) -> str:
+        if language != "ta":
+            return text
+        return self._translate_text(text, "ta")
 
     def _normalize_prompt_for_routing(self, text: str) -> str:
         q = (text or "").strip()
@@ -371,6 +443,23 @@ class JarvisEngine:
             parsed["query"] = lowered_prompt
         elif func_name == "web_lookup" and "query" not in parsed:
             parsed["query"] = lowered_prompt
+        elif func_name == "open_folder" and "folder_name" not in parsed:
+            # Recover concise folder names from noisy prompts like "open the download folder".
+            prompt_lower = lowered_prompt.lower()
+            alias_patterns = {
+                "downloads": r"\b(downloads?|download\s+folder)\b",
+                "documents": r"\b(documents?|document\s+folder)\b",
+                "desktop": r"\b(desktop)\b",
+                "videos": r"\b(videos?|movies?)\b",
+                "music": r"\b(music|songs?)\b",
+                "pictures": r"\b(pictures?|photos?)\b",
+            }
+            recovered_folder = None
+            for canonical, pattern in alias_patterns.items():
+                if re.search(pattern, prompt_lower):
+                    recovered_folder = canonical
+                    break
+            parsed["folder_name"] = recovered_folder or lowered_prompt
 
         # Generic fallback: fill required string params from the user prompt.
         try:
@@ -387,22 +476,25 @@ class JarvisEngine:
 
     def run_conversation(self, user_prompt: str) -> str:
         normalized_prompt = self._normalize_prompt_for_routing(user_prompt)
+        language = self._detect_user_language(normalized_prompt)
+        self.last_user_language = language
+
         controller_result = self.controller.handle_command(normalized_prompt)
         if controller_result.get("intent") != "unknown" or controller_result.get("action") == "clarification_required":
-            return json.dumps(controller_result)
+            return self._localize_controller_result(controller_result, language)
 
         if self._is_datetime_question(normalized_prompt):
             datetime_answer = self._answer_datetime_query(normalized_prompt)
             if datetime_answer:
-                return datetime_answer
+                return self._localize_plain_response(datetime_answer, language)
 
         if self._is_weather_question(normalized_prompt):
             weather_answer = self._answer_weather_query(normalized_prompt)
             if weather_answer:
-                return weather_answer
+                return self._localize_plain_response(weather_answer, language)
 
         if self._is_coding_request(normalized_prompt):
-            return self._direct_code_without_tools(normalized_prompt)
+            return self._localize_plain_response(self._direct_code_without_tools(normalized_prompt), language)
 
         if self._is_factual_question(normalized_prompt):
             q = (normalized_prompt or "").lower()
@@ -411,18 +503,22 @@ class JarvisEngine:
             # Always try live web first for ALL factual questions so answers are up-to-date.
             looked_up = self._try_web_lookup_answer(normalized_prompt)
             if looked_up:
-                return looked_up
+                return self._localize_plain_response(looked_up, language)
 
             if asks_winner and self._is_time_sensitive_question(normalized_prompt):
-                return "I could not verify the winner from reliable sources right now. Please ask again in a little while."
+                return self._localize_plain_response(
+                    "I could not verify the winner from reliable sources right now. Please ask again in a little while.",
+                    language,
+                )
 
             # Fall back to model knowledge with today's date already injected in system prompt.
             direct = self._direct_answer_without_tools(normalized_prompt)
             if direct and "could not" not in direct.lower() and "try again" not in direct.lower():
-                return direct
+                return self._localize_plain_response(direct, language)
 
-            return "I could not find a reliable answer right now. Please try again."
+            return self._localize_plain_response("I could not find a reliable answer right now. Please try again.", language)
 
+        self.system_instruction = self._build_system_instruction(language)
         messages = [
             {"role": "system", "content": self.system_instruction},
             {"role": "user", "content": user_prompt}
@@ -478,17 +574,23 @@ class JarvisEngine:
                     print(f"Failed to recover tool call: {parse_e}")
 
                 # Final fallback: answer directly without tools instead of failing the conversation.
-                return self._direct_answer_without_tools(user_prompt)
+                return self._localize_plain_response(self._direct_answer_without_tools(user_prompt), language)
 
             # Handle API rate limits with a clear spoken message.
             if "rate_limit_exceeded" in error_str or "Rate limit reached" in error_str:
                 wait_text = self._format_retry_wait(error_str)
                 if wait_text:
-                    return f"I have hit the Groq token limit. Please try again in about {wait_text}."
-                return "I have hit the Groq token limit right now. Please try again in a few minutes."
+                    return self._localize_plain_response(
+                        f"I have hit the Groq token limit. Please try again in about {wait_text}.",
+                        language,
+                    )
+                return self._localize_plain_response(
+                    "I have hit the Groq token limit right now. Please try again in a few minutes.",
+                    language,
+                )
 
             print(f"Groq API Error: {e}")
-            return "I am having trouble connecting to the brain, sir."
+            return self._localize_plain_response("I am having trouble connecting to the brain, sir.", language)
 
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls

@@ -1,5 +1,7 @@
 import os
 import re
+import json
+import difflib
 import shutil
 import subprocess
 import webbrowser
@@ -13,6 +15,33 @@ class SystemController:
         self.os_name = self._detect_os()
         self.pending_action: Optional[Dict[str, Any]] = None
         self.pending_file_choices: Optional[Dict[str, Any]] = None
+
+    def _normalize_folder_alias(self, folder_name: str) -> str:
+        text = (folder_name or "").strip().lower()
+        if not text:
+            return ""
+
+        text = re.sub(r"^the\s+", "", text)
+        text = re.sub(r"\s+folder$", "", text)
+        text = re.sub(r"\s+directory$", "", text)
+        text = text.strip()
+
+        alias_map = {
+            "download": "downloads",
+            "document": "documents",
+            "video": "videos",
+            "picture": "pictures",
+            "photo": "pictures",
+            "desktops": "desktop",
+            "homes": "home",
+            "my downloads": "downloads",
+            "my documents": "documents",
+            "my videos": "videos",
+            "my music": "music",
+            "my pictures": "pictures",
+            "my photos": "pictures",
+        }
+        return alias_map.get(text, text)
 
     def _detect_os(self) -> str:
         if os.name == "nt":
@@ -188,6 +217,25 @@ class SystemController:
                 "params": {"query": "movie", "folder_name": folder_name},
             }
 
+        play_match = re.match(r"^(?:play|open\s+and\s+play)\s+(.+)$", command, flags=re.IGNORECASE)
+        if play_match:
+            target = play_match.group(1).strip().strip("\"'")
+            if "telegram desktop" in target.lower() or "telegram" in target.lower():
+                return {
+                    "intent": "play_media_in_folder",
+                    "action": "play_media_in_folder",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"folder_hint": "telegram desktop", "query": ""},
+                }
+            return {
+                "intent": "open_file",
+                "action": "open_file",
+                "status": "success",
+                "dangerous": False,
+                "params": {"query": target, "search_mode": "media"},
+            }
+
         # Handle common ASR typo where "open" is recognized as "pen"
         if lowered.startswith("pen "):
             command = "open " + command[4:]
@@ -232,6 +280,39 @@ class SystemController:
                 "dangerous": False,
                 "params": {"message": "Yes, I am here and ready."},
             }
+
+        learn_correction = re.match(
+            r"^(?:learn|remember)\s+correction\s*:?\s*(.+?)\s+(?:means|as)\s+(.+)$",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if learn_correction:
+            wrong_phrase = learn_correction.group(1).strip().strip("\"'")
+            right_phrase = learn_correction.group(2).strip().strip("\"'")
+            if wrong_phrase and right_phrase:
+                return {
+                    "intent": "learn_asr_correction",
+                    "action": "learn_asr_correction",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"wrong": wrong_phrase, "right": right_phrase},
+                }
+
+        forget_correction = re.match(
+            r"^(?:forget|remove|delete)\s+correction\s*:?\s*(.+)$",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if forget_correction:
+            wrong_phrase = forget_correction.group(1).strip().strip("\"'")
+            if wrong_phrase:
+                return {
+                    "intent": "forget_asr_correction",
+                    "action": "forget_asr_correction",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"wrong": wrong_phrase},
+                }
 
         shell_match = re.match(r"^(?:run(?:\s+command)?|execute)\s+(.+)$", command, flags=re.IGNORECASE)
         if shell_match:
@@ -365,14 +446,14 @@ class SystemController:
                 }
 
             # Support folder opening commands like "open desktop folder"
-            folder_open_match = re.match(r"^(desktop|documents|downloads|videos|music|pictures)\s+folder$", target_lower)
+            folder_open_match = re.match(r"^(desktop|documents|document|downloads|download|videos|video|music|pictures|picture|photos|photo)\s+folder$", target_lower)
             if folder_open_match:
                 return {
                     "intent": "open_folder",
                     "action": "open_folder",
                     "status": "success",
                     "dangerous": False,
-                    "params": {"folder_name": folder_open_match.group(1)},
+                    "params": {"folder_name": self._normalize_folder_alias(folder_open_match.group(1))},
                 }
 
             # Clean location qualifiers from app commands (e.g. "whatsapp in desktop")
@@ -478,14 +559,29 @@ class SystemController:
                     "params": {"url": url},
                 }
 
-            # If user explicitly asks for a likely file/media name, prioritize file search.
-            if self._looks_like_file_query(target):
+            app_like_targets = {
+                "telegram", "whatsapp", "spotify", "vlc", "chrome", "edge", "firefox",
+                "notepad", "calculator", "explorer", "word", "excel", "powerpoint",
+                "media player", "windows media player", "code", "vs code", "github desktop",
+            }
+
+            if target_lower in app_like_targets:
+                return {
+                    "intent": "open_application",
+                    "action": "open_application",
+                    "status": "success",
+                    "dangerous": False,
+                    "params": {"app_name": target},
+                }
+
+            # Default to file search for plain names so commands like "open jananayagan" work.
+            if self._looks_like_file_query(target) or target_lower:
                 return {
                     "intent": "open_file",
                     "action": "open_file",
                     "status": "success",
                     "dangerous": False,
-                    "params": {"query": target},
+                    "params": {"query": target, "search_mode": "document"},
                 }
             
             return {
@@ -497,25 +593,6 @@ class SystemController:
             }
 
         # Play media commands
-        play_match = re.match(r"^(?:play|open\s+and\s+play)\s+(.+)$", command, flags=re.IGNORECASE)
-        if play_match:
-            target = play_match.group(1).strip().strip("\"'")
-            if "telegram desktop" in target.lower() or "telegram" in target.lower():
-                return {
-                    "intent": "play_media_in_folder",
-                    "action": "play_media_in_folder",
-                    "status": "success",
-                    "dangerous": False,
-                    "params": {"folder_hint": "telegram desktop", "query": ""},
-                }
-            return {
-                "intent": "open_file",
-                "action": "open_file",
-                "status": "success",
-                "dangerous": False,
-                "params": {"query": target},
-            }
-
         if re.search(r"(?:create|make)\s+(?:a\s+)?(?:new\s+)?folder(?:\s+(?:on|in)\s+(desktop|home\s?page|home))?$", lowered):
             return {
                 "intent": "create_folder",
@@ -643,6 +720,10 @@ class SystemController:
         try:
             if intent == "conversation_reply":
                 return self._response("conversation_reply", "conversation_reply", "success", params["message"])
+            if intent == "learn_asr_correction":
+                return self._learn_asr_correction(params["wrong"], params["right"])
+            if intent == "forget_asr_correction":
+                return self._forget_asr_correction(params["wrong"])
             if intent == "open_application":
                 return self._open_application(params["app_name"])
             if intent == "create_folder":
@@ -654,7 +735,7 @@ class SystemController:
             if intent == "play_media_in_folder":
                 return self._play_media_in_folder(params.get("folder_hint", "telegram desktop"), params.get("query", ""))
             if intent == "open_file":
-                return self._open_file(params["query"])
+                return self._open_file(params["query"], params.get("search_mode", "auto"))
             if intent == "open_file_in_folder":
                 return self._open_file_in_folder(params["query"], params["folder_name"])
             if intent == "delete_file":
@@ -786,8 +867,8 @@ class SystemController:
         target.write_text("", encoding="utf-8")
         return self._response("create_text_file", "create_text_file", "success", f"Created text file {target.name} on Desktop.")
 
-    def _open_file(self, query: str) -> Dict[str, Any]:
-        matches = self._find_files(query, limit=30)
+    def _open_file(self, query: str, search_mode: str = "auto") -> Dict[str, Any]:
+        matches = self._find_files(query, limit=30, search_mode=search_mode)
         if not matches:
             return self._response("open_file", "open_file", "failed", f"I could not find {query} on this computer.")
 
@@ -805,7 +886,7 @@ class SystemController:
         if len(exact_same_name) == 1:
             target = exact_same_name[0]
         else:
-            target = self._pick_best_media_match(matches, query)
+            target = self._pick_best_match(matches, query, search_mode=search_mode)
 
         try:
             os.startfile(str(target))
@@ -821,6 +902,8 @@ class SystemController:
         file_matches: List[Path] = []
         folder_matches: List[Path] = []
         query_lower = query.lower().strip()
+        normalized_query = self._normalize_media_query(query)
+        normalized_tokens = [t for t in normalized_query.split() if len(t) >= 2]
         for current_root, dirs, files in os.walk(target_folder, topdown=True):
             dirs[:] = [d for d in dirs if d.lower() not in {".git", "__pycache__", "node_modules"}]
 
@@ -831,7 +914,10 @@ class SystemController:
                         break
 
             for filename in files:
-                if query_lower in filename.lower():
+                filename_lower = filename.lower()
+                stem_lower = Path(filename).stem.lower()
+                token_hit = normalized_tokens and all(t in stem_lower for t in normalized_tokens)
+                if query_lower in filename_lower or normalized_query in stem_lower or token_hit:
                     file_matches.append(Path(current_root) / filename)
                     if len(file_matches) >= 15:
                         break
@@ -840,7 +926,7 @@ class SystemController:
 
         # Folder-first: if the requested item is a folder inside the folder, open it.
         if folder_matches:
-            chosen_folder = self._pick_best_media_match(folder_matches, query)
+            chosen_folder = self._pick_best_match(folder_matches, query)
             try:
                 os.startfile(str(chosen_folder))
                 return self._response(
@@ -906,7 +992,7 @@ class SystemController:
                 f"I found multiple files named {exact_same_name[0].name} in {folder_name}.\n{joined}\nSay open first one, open second one, or open number 1.",
             )
 
-        target = exact_same_name[0] if len(exact_same_name) == 1 else self._pick_best_media_match(file_matches, query)
+        target = exact_same_name[0] if len(exact_same_name) == 1 else self._pick_best_match(file_matches, query, search_mode="media")
         try:
             os.startfile(str(target))
             return self._response(
@@ -1037,29 +1123,106 @@ class SystemController:
         copied_path = shutil.copy2(source, destination_path / source.name)
         return self._response("copy_file", "copy_file", "success", f"Copied to {copied_path}")
 
-    def _find_files(self, query: str, limit: int = 10) -> List[Path]:
-        results: List[Path] = []
-        query_lower = query.lower()
+    def _find_files(self, query: str, limit: int = 10, search_mode: str = "auto") -> List[Path]:
+        scored_results: List[tuple[int, Path]] = []
+        query_lower = (query or "").lower().strip()
+        normalized_query = self._normalize_media_query(query_lower)
+        query_tokens = [t for t in normalized_query.split() if len(t) >= 2]
+        query_ext = Path(query_lower).suffix.lower()
+        media_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a"}
+        document_exts = {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".ppt", ".pptx", ".xls", ".xlsx"}
+        media_intent = bool(re.search(r"\b(movie|video|song|audio|music|mkv|mp4|avi|mov|wmv|webm)\b", normalized_query)) or query_ext in media_exts
+        document_intent = search_mode == "document" or bool(re.search(r"\b(pdf|doc|docx|txt|word|document|ppt|pptx|excel|sheet|presentation)\b", normalized_query)) or query_ext in document_exts
 
-        roots = self._get_search_roots()
+        # Stage 1: user folders only for low-latency lookup; Stage 2: full drives if needed.
+        roots = self._get_search_roots(include_drives=False)
         skip_dirs = {
             "windows", "system32", "syswow64", "$recycle.bin", "program files", "program files (x86)",
             "programdata", "appdata", "node_modules", ".git", "__pycache__"
         }
 
-        for root in roots:
-            if not root.exists():
-                continue
-            for current_root, dirs, files in os.walk(root, topdown=True):
-                dirs[:] = [d for d in dirs if d.lower() not in skip_dirs]
-                for filename in files:
-                    if query_lower in filename.lower():
-                        results.append(Path(current_root) / filename)
-                        if len(results) >= limit:
-                            return results
-        return results
+        def scan_roots(scan_roots: List[Path]) -> None:
+            for root in scan_roots:
+                if not root.exists():
+                    continue
+                for current_root, dirs, files in os.walk(root, topdown=True):
+                    dirs[:] = [d for d in dirs if d.lower() not in skip_dirs and not d.startswith(".")]
+                    for filename in files:
+                        name_lower = filename.lower()
+                        stem_lower = Path(filename).stem.lower()
+                        ext_lower = Path(filename).suffix.lower()
 
-    def _get_search_roots(self) -> List[Path]:
+                        score = 0
+                        if ext_lower in media_exts:
+                            score += 35
+                        if ext_lower in document_exts:
+                            score += 20
+                        if query_lower and query_lower == name_lower:
+                            score += 300
+                        elif query_lower and query_lower in name_lower:
+                            score += 140
+
+                        if normalized_query:
+                            if normalized_query == stem_lower:
+                                score += 220
+                            elif normalized_query in stem_lower:
+                                score += 120
+
+                        if query_tokens:
+                            overlap = sum(1 for token in query_tokens if token in stem_lower)
+                            score += overlap * 24
+
+                        if query_ext and ext_lower == query_ext:
+                            score += 40
+
+                        if search_mode == "media":
+                            if ext_lower in media_exts:
+                                score += 60
+                            elif ext_lower in document_exts:
+                                score -= 15
+                            else:
+                                score -= 25
+                        elif document_intent:
+                            if ext_lower in document_exts:
+                                score += 55
+                            elif ext_lower in media_exts:
+                                score -= 15
+                            else:
+                                score -= 10
+                        elif media_intent and ext_lower not in media_exts:
+                            score -= 30
+
+                        if normalized_query and len(normalized_query) >= 4:
+                            ratio = difflib.SequenceMatcher(None, normalized_query, stem_lower).ratio()
+                            if ratio >= 0.66:
+                                score += int(ratio * 80)
+
+                        if score > 0:
+                            if (search_mode == "media" or media_intent) and score < 30:
+                                continue
+                            scored_results.append((score, Path(current_root) / filename))
+
+        scan_roots(roots)
+        if not scored_results:
+            scan_roots(self._get_search_roots(include_drives=True))
+
+        if not scored_results:
+            return []
+
+        scored_results.sort(key=lambda item: item[0], reverse=True)
+        deduped: List[Path] = []
+        seen: set[str] = set()
+        for _, path in scored_results:
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(path)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    def _get_search_roots(self, include_drives: bool = True) -> List[Path]:
         roots: List[Path] = [
             Path.home(),
             Path.home() / "Desktop",
@@ -1070,7 +1233,7 @@ class SystemController:
             Path.home() / "Pictures",
         ]
 
-        if self.os_name == "windows":
+        if include_drives and self.os_name == "windows":
             for letter in ["C", "D", "E", "F", "G"]:
                 drive = Path(f"{letter}:\\")
                 if drive.exists():
@@ -1107,21 +1270,42 @@ class SystemController:
                             return results
         return results
 
-    def _pick_best_media_match(self, matches: List[Path], query: str) -> Path:
+    def _pick_best_match(self, matches: List[Path], query: str, search_mode: str = "auto") -> Path:
         media_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a"}
+        document_exts = {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".ppt", ".pptx", ".xls", ".xlsx"}
         query_lower = query.lower()
+        normalized_query = self._normalize_media_query(query)
+        query_tokens = [t for t in normalized_query.split() if len(t) >= 2]
         scored: List[tuple[int, Path]] = []
         for path in matches:
             score = 0
-            if path.suffix.lower() in media_exts:
+            stem_lower = path.stem.lower()
+            suffix = path.suffix.lower()
+            if suffix in media_exts:
                 score += 4
-            if query_lower == path.stem.lower():
-                score += 6
-            elif query_lower in path.stem.lower():
+            if suffix in document_exts:
                 score += 3
+            if query_lower == stem_lower:
+                score += 6
+            elif query_lower in stem_lower:
+                score += 3
+            if normalized_query and normalized_query == stem_lower:
+                score += 7
+            elif normalized_query and normalized_query in stem_lower:
+                score += 4
+            if query_tokens:
+                overlap = sum(1 for token in query_tokens if token in stem_lower)
+                score += overlap * 2
+            if search_mode == "media" and suffix in media_exts:
+                score += 5
+            if search_mode == "document" and suffix in document_exts:
+                score += 5
             scored.append((score, path))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored[0][1]
+
+    def _pick_best_media_match(self, matches: List[Path], query: str) -> Path:
+        return self._pick_best_match(matches, query, search_mode="media")
 
     def _same_name_matches(self, matches: List[Path], query: str) -> List[Path]:
         normalized_query = (query or "").strip().strip("\"'").lower()
@@ -1133,6 +1317,25 @@ class SystemController:
         if has_ext:
             return [p for p in matches if p.name.lower() == query_path.name.lower()]
         return [p for p in matches if p.stem.lower() == query_path.stem.lower()]
+
+    def _normalize_media_query(self, query: str) -> str:
+        text = (query or "").strip().lower()
+        if not text:
+            return ""
+
+        # Common ASR extension confusions and spoken forms.
+        text = re.sub(r"\btkv\b", "mkv", text)
+        text = re.sub(r"\bm\s*k\s*v\b", "mkv", text)
+        text = re.sub(r"\bm\s*p\s*4\b", "mp4", text)
+        text = re.sub(r"\bdot\s+(mkv|mp4|avi|mov|wmv|webm)\b", r".\1", text)
+
+        # Remove common filler words often spoken with media commands.
+        filler_pattern = (
+            r"\b(open|play|movie|video|vlc|file|please|the|a|an|in|from|inside|folder)\b"
+        )
+        text = re.sub(filler_pattern, " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
     def _format_numbered_paths(self, paths: List[Path]) -> str:
         lines = [f"{idx}. {path}" for idx, path in enumerate(paths, start=1)]
@@ -1184,7 +1387,7 @@ class SystemController:
         return Path(expanded)
 
     def _resolve_folder_name(self, folder_name: str) -> Optional[Path]:
-        name = (folder_name or "").strip().lower()
+        name = self._normalize_folder_alias(folder_name)
         mapping = {
             "desktop": Path.home() / "Desktop",
             "documents": Path.home() / "Documents",
@@ -1480,6 +1683,83 @@ class SystemController:
         if "." in normalized:
             return f"https://{normalized}"
         return f"https://www.{normalized}.com"
+
+    def _asr_adaptation_path(self) -> Path:
+        custom = os.environ.get("JARVIS_ASR_ADAPT_FILE", "").strip()
+        if custom:
+            return Path(os.path.expandvars(os.path.expanduser(custom)))
+        return Path(__file__).resolve().parent.parent / "asr_adaptation.json"
+
+    def _load_asr_adaptation(self) -> Dict[str, Any]:
+        path = self._asr_adaptation_path()
+        try:
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    payload.setdefault("phrase_hints", [])
+                    payload.setdefault("replacements", {})
+                    return payload
+        except Exception:
+            pass
+        return {"phrase_hints": [], "replacements": {}}
+
+    def _save_asr_adaptation(self, payload: Dict[str, Any]) -> None:
+        path = self._asr_adaptation_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    def _learn_asr_correction(self, wrong: str, right: str) -> Dict[str, Any]:
+        wrong_norm = wrong.lower().strip()
+        right_norm = right.lower().strip()
+        if not wrong_norm or not right_norm:
+            return self._response("learn_asr_correction", "learn_asr_correction", "failed", "Please provide both wrong and correct phrases.")
+
+        payload = self._load_asr_adaptation()
+        replacements = payload.get("replacements", {})
+        if not isinstance(replacements, dict):
+            replacements = {}
+        replacements[wrong_norm] = right_norm
+        payload["replacements"] = replacements
+
+        phrase_hints = payload.get("phrase_hints", [])
+        if not isinstance(phrase_hints, list):
+            phrase_hints = []
+        for token in [wrong_norm, right_norm]:
+            if token and token not in phrase_hints:
+                phrase_hints.append(token)
+        payload["phrase_hints"] = phrase_hints[:300]
+
+        try:
+            self._save_asr_adaptation(payload)
+            return self._response(
+                "learn_asr_correction",
+                "learn_asr_correction",
+                "success",
+                f"Learned correction: {wrong_norm} means {right_norm}.",
+            )
+        except Exception as exc:
+            return self._response("learn_asr_correction", "learn_asr_correction", "failed", f"Could not save correction: {exc}")
+
+    def _forget_asr_correction(self, wrong: str) -> Dict[str, Any]:
+        wrong_norm = wrong.lower().strip()
+        if not wrong_norm:
+            return self._response("forget_asr_correction", "forget_asr_correction", "failed", "Please provide the correction phrase to remove.")
+
+        payload = self._load_asr_adaptation()
+        replacements = payload.get("replacements", {})
+        if not isinstance(replacements, dict):
+            replacements = {}
+
+        if wrong_norm not in replacements:
+            return self._response("forget_asr_correction", "forget_asr_correction", "failed", f"No saved correction found for {wrong_norm}.")
+
+        replacements.pop(wrong_norm, None)
+        payload["replacements"] = replacements
+        try:
+            self._save_asr_adaptation(payload)
+            return self._response("forget_asr_correction", "forget_asr_correction", "success", f"Removed correction for {wrong_norm}.")
+        except Exception as exc:
+            return self._response("forget_asr_correction", "forget_asr_correction", "failed", f"Could not remove correction: {exc}")
 
     def _response(self, intent: str, action: str, status: str, message: str) -> Dict[str, Any]:
         return {

@@ -143,3 +143,55 @@ Notes for tomorrow (pending verification/fix)
   - "open song in Music folder"
   - "open report in Documents folder"
 
+
+==============================
+April 2, 2026
+==============================
+
+Today's goal
+- Make JARVIS truly bilingual (Tamil + English)
+- If user speaks English -> respond in English
+- If user speaks Tamil -> respond in Tamil
+- Keep all existing actions working (file access, system actions, info lookup, tool calls)
+
+What was completed today
+1) core/engine.py
+- Added per-utterance language detection for English/Tamil
+- Added dynamic system instruction builder based on detected language
+- Added response localization for:
+   - deterministic controller JSON message field
+   - date/time responses
+   - weather responses
+   - factual/web lookup fallbacks
+   - rate-limit and error messages
+- Added Tamil translation helper using Groq so action/tool confirmations are also spoken in Tamil when needed
+
+2) core/voice.py
+- Added Tamil into ASR language list (ta-IN) along with English (en-IN, en-US)
+- Added text language detection helper for TTS selection
+- Added Tamil-capable TTS fallback using gTTS + playsound
+- Kept Windows native SAPI path for English responses
+- Kept pyttsx3 as cross-platform fallback
+
+3) requirements.txt
+- Added:
+   - gTTS>=2.5.0
+   - playsound==1.2.2
+
+4) README.md
+- Documented bilingual capability and optional env settings:
+   - JARVIS_ASR_LANGUAGES=en-IN,en-US,ta-IN
+   - JARVIS_USE_GTTS=true
+
+Verification done
+- Installed new packages in project venv
+- Static editor error check passed for updated files
+- Python compile test passed:
+   - core/voice.py
+   - core/engine.py
+
+Current behavior summary
+- Tamil input -> Tamil output
+- English input -> English output
+- Existing tool workflow remains active in both languages
+

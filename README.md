@@ -11,6 +11,10 @@ A modular, voice-controlled AI assistant featuring a futuristic HUD interface, a
 - **Dual Modes**: 
   - **Voice Mode**: Full hands-free interaction using speech recognition and TTS.
   - **Text Mode**: Silent command-line interface for distinct environments.
+- **Bilingual Voice (English + Tamil)**:
+   - Auto-detects user language per utterance.
+   - Responds in English for English input and Tamil for Tamil input.
+   - Supports Tamil recognition via `ta-IN` and Tamil speech via `gTTS` fallback.
 - **Modular Skill System**: Ease of extensibility. New capabilities can be added as drop-in modules in the `skills/` directory.
 
 ## 🧠 Skills & Capabilities
@@ -94,6 +98,9 @@ All system-controller actions return JSON in this format:
    ```env
    GROQ_API_KEY=your_key_here
    # Add other keys as needed by specific skills
+   # Optional multilingual tuning
+   JARVIS_ASR_LANGUAGES=en-IN,en-US,ta-IN
+   JARVIS_USE_GTTS=true
    ```
 
 ## 💻 Usage

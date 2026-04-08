@@ -13,3 +13,5 @@ torchvision
 pywhatkit
 selenium
 webdriver-manager
+gTTS>=2.5.0
+playsound==1.2.2

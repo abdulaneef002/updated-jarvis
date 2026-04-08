@@ -2,12 +2,305 @@ import os
 import sys
 import re
 import json
+import audioop
+import tempfile
 import subprocess
+from pathlib import Path
 import pyttsx3
 import speech_recognition as sr
 
 # Initialize engine globally to avoid re-initialization issues
 engine = None
+
+ASR_KEYWORD_BOOST = {
+    "pdf": 0.20,
+    "file": 0.08,
+    "document": 0.10,
+    "folder": 0.08,
+    "open": 0.05,
+    "read": 0.05,
+}
+
+ASR_INTENT_HINTS = (
+    "open",
+    "file",
+    "folder",
+    "document",
+    "read",
+    "find",
+    "search",
+)
+
+DEFAULT_PHRASE_HINTS = (
+    "pdf",
+    "docx",
+    "resume",
+    "telegram",
+    "whatsapp",
+    "youtube",
+    "vlc",
+    "movie",
+    "video",
+)
+
+ASR_ADAPTATION_FILENAME = "asr_adaptation.json"
+FILE_EXTENSIONS = "pdf|docx|txt|xlsx|xls|pptx|ppt|png|jpg|jpeg|gif|webp|mp3|mp4|mkv|avi|mov|zip|rar|7z"
+DOT_MARKER_PATTERN = r"(?:dot|point|period|full\s*stop|short|shot|sort|dart)"
+PRIMARY_ASR_LANGUAGE = (os.environ.get("JARVIS_PRIMARY_ASR_LANGUAGE", "en-IN") or "en-IN").strip()
+
+
+def _env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _env_float(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except Exception:
+        value = float(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _get_phrase_hints() -> list[str]:
+    raw = os.environ.get("JARVIS_PHRASE_HINTS", "")
+    hints = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    if not hints:
+        hints = list(DEFAULT_PHRASE_HINTS)
+
+    adaptation = _load_asr_adaptation()
+    learned_hints = adaptation.get("phrase_hints", []) if isinstance(adaptation, dict) else []
+    for hint in learned_hints:
+        clean = str(hint).strip().lower()
+        if clean and clean not in hints:
+            hints.append(clean)
+    return hints
+
+
+def _get_project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _get_asr_adaptation_path() -> Path:
+    custom = os.environ.get("JARVIS_ASR_ADAPT_FILE", "").strip()
+    if custom:
+        return Path(os.path.expandvars(os.path.expanduser(custom)))
+    return _get_project_root() / ASR_ADAPTATION_FILENAME
+
+
+def _load_asr_adaptation() -> dict:
+    path = _get_asr_adaptation_path()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("phrase_hints", [])
+                data.setdefault("replacements", {})
+                return data
+    except Exception:
+        pass
+    return {"phrase_hints": [], "replacements": {}}
+
+
+def _save_asr_adaptation(data: dict) -> None:
+    path = _get_asr_adaptation_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=True, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _apply_adaptive_replacements(text: str) -> str:
+    if not text:
+        return text
+    adaptation = _load_asr_adaptation()
+    replacements = adaptation.get("replacements", {}) if isinstance(adaptation, dict) else {}
+    if not isinstance(replacements, dict) or not replacements:
+        return text
+
+    out = text
+    for wrong in sorted(replacements.keys(), key=len, reverse=True):
+        right = str(replacements.get(wrong, "")).strip().lower()
+        wrong_clean = str(wrong).strip().lower()
+        if not wrong_clean or not right:
+            continue
+        out = re.sub(rf"\b{re.escape(wrong_clean)}\b", right, out)
+    return out
+
+
+def _learn_from_transcript(text: str, phrase_hints: list[str]) -> None:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return
+
+    learned_tokens: set[str] = set()
+    for match in re.finditer(rf"\b([a-z0-9][a-z0-9 _-]{{1,80}}\.(?:{FILE_EXTENSIONS}))\b", normalized):
+        filename = match.group(1).strip().lower()
+        stem = Path(filename).stem.lower().strip()
+        if filename:
+            learned_tokens.add(filename)
+        if stem and len(stem) >= 3:
+            learned_tokens.add(stem)
+            for part in re.split(r"[_\-\s]+", stem):
+                if len(part) >= 3:
+                    learned_tokens.add(part)
+
+    if not learned_tokens:
+        return
+
+    adaptation = _load_asr_adaptation()
+    existing = adaptation.get("phrase_hints", []) if isinstance(adaptation, dict) else []
+    if not isinstance(existing, list):
+        existing = []
+    merged = {str(x).strip().lower() for x in existing if str(x).strip()}
+    merged.update(learned_tokens)
+    merged.update(str(x).strip().lower() for x in phrase_hints if str(x).strip())
+
+    # Keep adaptation file bounded and focused.
+    adaptation["phrase_hints"] = sorted(merged)[:300]
+    if "replacements" not in adaptation or not isinstance(adaptation["replacements"], dict):
+        adaptation["replacements"] = {}
+    _save_asr_adaptation(adaptation)
+
+
+def _is_weak_signal(audio: sr.AudioData, min_rms_override: int | None = None) -> bool:
+    """Reject very low-energy clips that are likely background noise only."""
+    try:
+        sample_width = getattr(audio, "sample_width", 2)
+        rms = audioop.rms(audio.frame_data, sample_width)
+        min_rms = min_rms_override if min_rms_override is not None else _env_int("JARVIS_MIN_RMS", 90, minimum=20, maximum=5000)
+        return rms < min_rms
+    except Exception:
+        return False
+
+
+def _is_probable_noise(audio: sr.AudioData) -> bool:
+    """Reject clips with extreme zero-crossing ratio that often indicates hiss/static."""
+    try:
+        raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
+        sample_count = max(1, len(raw) // 2)
+        zc = audioop.cross(raw, 2)
+        zcr = zc / sample_count
+        max_zcr = _env_float("JARVIS_MAX_ZCR", 0.42, minimum=0.15, maximum=0.8)
+        rms = audioop.rms(raw, 2)
+        if rms <= 0:
+            return True
+        peak = audioop.max(raw, 2)
+        peak_to_rms = peak / max(rms, 1)
+        max_peak_to_rms = _env_float("JARVIS_MAX_PEAK_TO_RMS", 10.0, minimum=3.0, maximum=40.0)
+        return zcr > max_zcr and peak_to_rms > max_peak_to_rms
+    except Exception:
+        return False
+
+
+def _is_low_quality_transcript(transcript: str) -> bool:
+    text = (transcript or "").strip().lower()
+    if not text:
+        return True
+    if len(text) <= 2:
+        return True
+    return bool(re.match(r"^(um+|uh+|hmm+|mm+|ah+|ok|okay|yes|yeah|no|hello|hi)$", text))
+
+
+def _candidate_score(text: str, phrase_hints: list[str]) -> float:
+    lower = (text or "").lower().strip()
+    if not lower:
+        return -1.0
+
+    score = 0.2 + (min(len(lower), 120) / 1100.0)
+    for keyword, boost in ASR_KEYWORD_BOOST.items():
+        if keyword in lower:
+            score += boost
+
+    for hint in phrase_hints:
+        if hint and hint in lower:
+            score += 0.10
+
+    # Prefer transcriptions with meaningful words over tiny fragments.
+    word_count = len([w for w in lower.split() if w])
+    score += min(word_count, 12) * 0.03
+    return score
+
+
+def _extract_google_candidates(raw_result) -> list[str]:
+    if not isinstance(raw_result, dict):
+        return []
+    alternatives = raw_result.get("alternative", [])
+    if not alternatives:
+        return []
+
+    collected: list[str] = []
+    for alt in alternatives:
+        transcript = (alt.get("transcript") or "").strip()
+        if transcript:
+            collected.append(transcript)
+    return collected
+
+
+def _select_best_candidate(candidates: list[str], phrase_hints: list[str]) -> str:
+    if not candidates:
+        return ""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        normalized = item.lower().strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(item)
+
+    if not deduped:
+        return ""
+
+    best = max(deduped, key=lambda text: _candidate_score(text, phrase_hints))
+    return best
+
+
+def _recognize_best_result(recognizer: sr.Recognizer, audio: sr.AudioData, language: str, phrase_hints: list[str]) -> tuple[str, float]:
+    try:
+        raw_result = recognizer.recognize_google(audio, show_all=True, language=language)
+    except Exception:
+        return "", -1.0
+
+    candidates = _extract_google_candidates(raw_result)
+    if not candidates:
+        return "", -1.0
+
+    best_candidate = _select_best_candidate(candidates, phrase_hints)
+    if not best_candidate:
+        return "", -1.0
+
+    return best_candidate, _candidate_score(best_candidate, phrase_hints)
+
+
+def _calibrate_ambient_noise(r: sr.Recognizer, source) -> None:
+    rounds = _env_int("JARVIS_NOISE_CALIBRATION_ROUNDS", 3, minimum=1, maximum=6)
+    duration = _env_float("JARVIS_NOISE_SAMPLE_SEC", 1.2, minimum=0.4, maximum=3.0)
+    thresholds: list[int] = []
+    for _ in range(rounds):
+        try:
+            r.adjust_for_ambient_noise(source, duration=duration)
+            thresholds.append(int(r.energy_threshold))
+        except Exception:
+            continue
+
+    if thresholds:
+        thresholds.sort()
+        median = thresholds[len(thresholds) // 2]
+        r.energy_threshold = min(1200, max(100, int(median * 1.1)))
 
 def init_engine():
     global engine
@@ -59,11 +352,155 @@ def _extract_best_transcript(raw_result) -> str:
             confidence = 0.55
         # Slightly favor longer candidates when confidence is tied.
         score = float(confidence) + (min(len(transcript), 80) / 1000.0)
+        lower = transcript.lower()
+        for keyword, boost in ASR_KEYWORD_BOOST.items():
+            if keyword in lower:
+                score += boost
         if score > best_score:
             best_score = score
             best_text = transcript
 
     return best_text
+
+
+def _normalize_recognition_text(text: str) -> str:
+    """Fix frequent speech-recognition confusions for command phrases."""
+    if not text:
+        return ""
+
+    normalized = text.lower().strip()
+
+    # Convert spaced spelling to canonical forms.
+    normalized = re.sub(r"\bp\s*d\s*f\b", "pdf", normalized)
+    normalized = re.sub(r"\bdoc\s*x\b", "docx", normalized)
+    normalized = re.sub(r"\bm\s*k\s*v\b", "mkv", normalized)
+    normalized = re.sub(r"\bm\s*p\s*4\b", "mp4", normalized)
+    normalized = re.sub(r"\btkv\b", "mkv", normalized)
+    normalized = re.sub(r"\bdot\s+(mkv|mp4|avi|mov|wmv|webm|pdf|docx|txt)\b", r".\1", normalized)
+    normalized = re.sub(rf"\b{DOT_MARKER_PATTERN}\s+({FILE_EXTENSIONS})\b", r".\1", normalized)
+
+    # Handle phrases like "open resume short pdf" / "resume dot pdf".
+    normalized = re.sub(
+        rf"\b([a-z0-9][a-z0-9 _-]{{1,80}}?)\s+{DOT_MARKER_PATTERN}\s+({FILE_EXTENSIONS})\b",
+        lambda m: f"{m.group(1).strip()}.{m.group(2)}",
+        normalized,
+    )
+
+    # Keep dotted filenames tightly formatted.
+    normalized = re.sub(r"\s*\.\s*", ".", normalized)
+
+    # Common media-title confusion in ASR: cold <-> gold.
+    if re.search(r"\b(play|open)\b", normalized):
+        normalized = re.sub(r"\bgold\s+storage\b", "cold storage", normalized)
+        normalized = re.sub(r"\bgoal\s+storage\b", "cold storage", normalized)
+
+    has_file_intent = any(hint in normalized for hint in ASR_INTENT_HINTS)
+    asks_for_document = any(w in normalized for w in (" file", "document", "doc ", ".pdf", "pdf "))
+    mentions_media = any(w in normalized for w in ("movie", "song", "music", "youtube", "folder"))
+    if has_file_intent and asks_for_document and not mentions_media:
+        # Typical confusion: "pdf" can be misheard as "video" in noisy environments.
+        normalized = re.sub(r"\bvideo\b", "pdf", normalized)
+        normalized = re.sub(r"\bvideos\b", "pdfs", normalized)
+
+    normalized = _apply_adaptive_replacements(normalized)
+
+    return normalized
+
+
+def _get_asr_languages() -> list[str]:
+    raw = os.environ.get("JARVIS_ASR_LANGUAGES", "en-IN,en-US,ta-IN")
+    langs = [x.strip() for x in raw.split(",") if x.strip()]
+    return langs or ["en-IN", "en-US", "ta-IN"]
+
+
+def _get_asr_language_order() -> list[str]:
+    langs = _get_asr_languages()
+    ordered: list[str] = []
+    if PRIMARY_ASR_LANGUAGE and PRIMARY_ASR_LANGUAGE in langs:
+        ordered.append(PRIMARY_ASR_LANGUAGE)
+
+    for preferred in ("ta-IN", "en-US"):
+        if preferred in langs and preferred not in ordered:
+            ordered.append(preferred)
+
+    for lang in langs:
+        if lang not in ordered:
+            ordered.append(lang)
+    return ordered
+
+
+def _detect_text_language(text: str) -> str:
+    sample = (text or "").strip().lower()
+    if not sample:
+        return "en"
+
+    if re.search(r"[\u0B80-\u0BFF]", sample):
+        return "ta"
+
+    tamil_romanized_markers = (
+        "vanakkam", "tamizh", "tamil", "ungal", "ennai", "epadi", "enna", "nandri"
+    )
+    if any(marker in sample for marker in tamil_romanized_markers):
+        return "ta"
+
+    return "en"
+
+
+def _select_voice_for_language(tts_engine, language: str) -> None:
+    try:
+        voices = tts_engine.getProperty("voices")
+    except Exception:
+        return
+
+    if language == "ta":
+        for voice in voices:
+            details = " ".join(
+                [
+                    str(getattr(voice, "name", "")),
+                    str(getattr(voice, "id", "")),
+                    str(getattr(voice, "languages", "")),
+                ]
+            ).lower()
+            if "ta" in details or "tamil" in details:
+                try:
+                    tts_engine.setProperty("voice", voice.id)
+                    return
+                except Exception:
+                    continue
+    else:
+        for voice in voices:
+            name = str(getattr(voice, "name", "")).lower()
+            if "male" in name or "david" in name or "mark" in name:
+                try:
+                    tts_engine.setProperty("voice", voice.id)
+                    return
+                except Exception:
+                    continue
+
+
+def _speak_with_gtts(text: str, language: str) -> bool:
+    lang_code = "ta" if language == "ta" else "en"
+    try:
+        from gtts import gTTS
+        from playsound import playsound
+    except Exception:
+        return False
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            temp_path = tmp.name
+        gTTS(text=text, lang=lang_code, slow=False).save(temp_path)
+        playsound(temp_path)
+        return True
+    except Exception:
+        return False
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 def _clean_for_speech(text: str) -> str:
     """Convert text to a clean, speakable string."""
@@ -100,19 +537,35 @@ def _clean_for_speech(text: str) -> str:
     return text.strip()
 
 
-def speak(text):
+def _emit_runtime_status(status: str) -> None:
+    try:
+        from gui.app import set_runtime_status
+        set_runtime_status(status)
+    except Exception:
+        pass
+
+
+def speak(text, language: str | None = None):
     global is_speaking
     text = _clean_for_speech(text)
+    lang = language or _detect_text_language(text)
 
     # Print first so user sees it even if audio fails
     print(f"JARVIS: {text}")
+    _emit_runtime_status("Speaking...")
 
     # Set flag to True before speaking
     is_speaking = True
 
     try:
-        # On Windows, use native SAPI first because pyttsx3 can be silent on some setups.
-        if sys.platform == "win32":
+        # Use gTTS path for Tamil (cloud voice, works even when Tamil SAPI voice is unavailable).
+        prefer_gtts = os.environ.get("JARVIS_USE_GTTS", "true").lower() in {"1", "true", "yes"}
+        if prefer_gtts and lang == "ta":
+            if _speak_with_gtts(text, lang):
+                return
+
+        # On Windows, use native SAPI first for English because pyttsx3 can be silent on some setups.
+        if sys.platform == "win32" and lang == "en":
             escaped = text.replace("'", "''")
             ps = (
                 "Add-Type -AssemblyName System.Speech; "
@@ -132,6 +585,7 @@ def speak(text):
         try:
             tts_engine = init_engine()
             if tts_engine:
+                _select_voice_for_language(tts_engine, lang)
                 tts_engine.say(text)
                 tts_engine.runAndWait()
             else:
@@ -144,6 +598,7 @@ def speak(text):
                 engine = None
                 tts_engine = init_engine()
                 if tts_engine:
+                    _select_voice_for_language(tts_engine, lang)
                     tts_engine.say(text)
                     tts_engine.runAndWait()
             except Exception as e2:
@@ -152,6 +607,7 @@ def speak(text):
     finally:
         # Ensure flag is reset to False even if errors occur
         is_speaking = False
+        _emit_runtime_status("Ready")
 
 def listen():
     global is_speaking
@@ -161,26 +617,34 @@ def listen():
 
     r = sr.Recognizer()
     r.dynamic_energy_threshold = True
-    r.dynamic_energy_adjustment_damping = 0.2
-    r.dynamic_energy_ratio = 1.7
-    r.energy_threshold = int(os.environ.get("JARVIS_ENERGY_THRESHOLD", "220"))
-    r.pause_threshold = 0.75
-    r.phrase_threshold = 0.25
-    r.non_speaking_duration = 0.35
+    r.dynamic_energy_adjustment_damping = 0.10
+    r.dynamic_energy_ratio = 1.35
+    r.energy_threshold = _env_int("JARVIS_ENERGY_THRESHOLD", 260, minimum=120, maximum=1400)
+    r.pause_threshold = 0.45
+    r.phrase_threshold = 0.12
+    r.non_speaking_duration = 0.18
     r.operation_timeout = 10
 
-    with sr.Microphone() as source:
+    mic_sample_rate = _env_int("JARVIS_MIC_SAMPLE_RATE", 16000, minimum=8000, maximum=48000)
+    mic_chunk_size = _env_int("JARVIS_MIC_CHUNK_SIZE", 512, minimum=256, maximum=2048)
+    phrase_hints = _get_phrase_hints()
+
+    with sr.Microphone(sample_rate=mic_sample_rate, chunk_size=mic_chunk_size) as source:
         print("Listening...")
+        _emit_runtime_status("Listening...")
         try:
-            r.adjust_for_ambient_noise(source, duration=1.2)
+            _calibrate_ambient_noise(r, source)
+            # Keep threshold in a practical range after ambient calibration.
+            r.energy_threshold = min(1200, max(100, int(r.energy_threshold)))
         except Exception:
             pass
 
+        dynamic_min_rms = max(70, int(r.energy_threshold * 0.45))
+
         # Retry with progressively larger listen windows for noisy/slow speech.
         listen_profiles = [
-            {"timeout": 5, "phrase_time_limit": 8},
-            {"timeout": 7, "phrase_time_limit": 12},
-            {"timeout": 8, "phrase_time_limit": 15},
+            {"timeout": 4, "phrase_time_limit": 8},
+            {"timeout": 6, "phrase_time_limit": 12},
         ]
 
         for profile in listen_profiles:
@@ -191,15 +655,48 @@ def listen():
                     phrase_time_limit=profile["phrase_time_limit"],
                 )
                 print("Recognizing...")
+                _emit_runtime_status("Recognizing...")
 
-                raw_result = r.recognize_google(audio, show_all=True)
-                best = _extract_best_transcript(raw_result)
-                if best:
-                    return best.lower().strip()
+                if _is_weak_signal(audio, min_rms_override=dynamic_min_rms):
+                    # Skip very low-energy clips to avoid random noisy transcriptions.
+                    continue
+                if _is_probable_noise(audio):
+                    continue
 
-                fallback = r.recognize_google(audio)
-                if fallback:
-                    return fallback.lower().strip()
+                language_order = _get_asr_language_order()
+                primary_language = language_order[0] if language_order else PRIMARY_ASR_LANGUAGE or "en-IN"
+                best_candidate, best_score = _recognize_best_result(r, audio, primary_language, phrase_hints)
+
+                if best_candidate and not _is_low_quality_transcript(best_candidate) and best_score >= 0.32:
+                    normalized = _normalize_recognition_text(best_candidate)
+                    _learn_from_transcript(normalized, phrase_hints)
+                    _emit_runtime_status("Ready")
+                    return normalized
+
+                fallback_language = language_order[1] if len(language_order) > 1 else None
+                if fallback_language:
+                    fallback_candidate, fallback_score = _recognize_best_result(r, audio, fallback_language, phrase_hints)
+                    if fallback_candidate and fallback_score > best_score:
+                        best_candidate = fallback_candidate
+                        best_score = fallback_score
+
+                if best_candidate and not _is_low_quality_transcript(best_candidate):
+                    normalized = _normalize_recognition_text(best_candidate)
+                    _learn_from_transcript(normalized, phrase_hints)
+                    _emit_runtime_status("Ready")
+                    return normalized
+
+                # Optional offline fallback when PocketSphinx is installed.
+                if os.environ.get("JARVIS_ENABLE_SPHINX_FALLBACK", "false").lower() in {"1", "true", "yes"}:
+                    try:
+                        offline = r.recognize_sphinx(audio)
+                        if offline:
+                            normalized = _normalize_recognition_text(offline)
+                            _learn_from_transcript(normalized, phrase_hints)
+                            _emit_runtime_status("Ready")
+                            return normalized
+                    except Exception:
+                        pass
 
             except sr.UnknownValueError:
                 # Reduce threshold slightly after misses to catch softer speech.

@@ -11,6 +11,8 @@ ACCENT_COLOR = QColor("#FFFFFF")   # White
 BG_COLOR = QColor("#000000")       # Black
 WARNING_COLOR = QColor("#FFA500")  # Orange (for Pause)
 
+_gui_window = None
+
 class HexagonPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -207,6 +209,8 @@ class CentralReactor(QWidget):
 
 
 class JarvisGUI(QMainWindow):
+    status_updated = pyqtSignal(str)
+
     def __init__(self, pause_event):
         super().__init__()
         self.pause_event = pause_event
@@ -223,7 +227,11 @@ class JarvisGUI(QMainWindow):
         # Main Layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
+        outer_layout = QVBoxLayout(central_widget)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        main_layout = QHBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         
         # Left Panel (Hexagons)
@@ -237,6 +245,24 @@ class JarvisGUI(QMainWindow):
         # Right Panel (Telemetry)
         self.right_panel = TelemetryPanel()
         main_layout.addWidget(self.right_panel)
+
+        # Bottom status line for runtime visibility.
+        self.status_label = QLabel("Status: Standby")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setFixedHeight(38)
+        self.status_label.setStyleSheet(
+            "color: #00FFFF;"
+            "background-color: rgba(0, 0, 0, 170);"
+            "font-size: 16px;"
+            "font-weight: 600;"
+            "border-top: 1px solid #1f1f1f;"
+            "letter-spacing: 0.8px;"
+        )
+
+        outer_layout.addLayout(main_layout, stretch=1)
+        outer_layout.addWidget(self.status_label)
+
+        self.status_updated.connect(self._set_status_text)
         
         # Click listener shortcut (using mousePressEvent on window)
 
@@ -260,8 +286,22 @@ class JarvisGUI(QMainWindow):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
 
+    def _set_status_text(self, status: str):
+        text = (status or "").strip() or "Standby"
+        self.status_label.setText(f"Status: {text}")
+
+
+def set_runtime_status(status: str):
+    global _gui_window
+    if _gui_window is not None:
+        _gui_window.status_updated.emit(status)
+
 def run_gui(pause_event):
+    global _gui_window
     app = QApplication(sys.argv)
     window = JarvisGUI(pause_event)
+    _gui_window = window
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    _gui_window = None
+    sys.exit(exit_code)

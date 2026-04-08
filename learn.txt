@@ -111,3 +111,53 @@ Located in `skills/`, these are the plugins that give JARVIS powers.
 7.  **Result**: `weather_ops.py` returns specific data (e.g., "30°C, Sunny").
 8.  **Final Response**: `engine` gives this data back to Groq. Groq constructs a sentence: "It is currently 30 degrees Celsius and sunny in Mumbai."
 9.  **Speak**: `voice.speak` says this sentence aloud.
+
+---
+
+## 5. What You Learn From April 2, 2026 Update (Bilingual Tamil + English)
+
+### A. Core Design Pattern Used
+For multilingual assistants, separate the pipeline into 3 steps:
+1. **Understand language** (ASR + language detection)
+2. **Process intent and tools** (existing command/tool logic unchanged)
+3. **Speak in same language** (localized response + language-specific TTS)
+
+This keeps your skill system stable while adding multilingual support safely.
+
+### B. Where It Was Added in Your Code
+1. **Language detection and localization**: `core/engine.py`
+2. **Tamil + English speech recognition and TTS routing**: `core/voice.py`
+3. **Tamil speech dependencies**: `requirements.txt`
+
+### C. Important Practical Rule
+Do not rewrite each skill for every language.
+
+Instead:
+1. Keep tools/skills language-neutral (same Python functions)
+2. Detect user language once per query
+3. Localize only user-facing message text
+
+This is exactly what your current implementation now does.
+
+### D. Why This Works Without Breaking Features
+Your command execution path is still the same:
+1. User speaks
+2. Query goes to existing controller/tools
+3. Tool returns result
+4. Final message is localized to Tamil/English
+5. TTS speaks in the matched language
+
+So file access, info retrieval, and system actions continue to work.
+
+### E. What To Practice Next
+1. Test these voice inputs:
+    - English: "open telegram"
+    - Tamil: "டெலிகிராம் திற"
+2. Observe language-matched responses.
+3. Add more Tamil trigger words in language detection if needed.
+4. Add a manual override mode later: `auto`, `english-only`, `tamil-only`.
+
+### F. Key Engineering Lesson
+Multilingual support is not only translation.
+It is **end-to-end language consistency**:
+ASR language selection + routing + response language + TTS voice selection.

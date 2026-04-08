@@ -4,11 +4,13 @@ import argparse
 import threading 
 import time
 import json
+import re
+import difflib
 from dotenv import load_dotenv
 from core.voice import speak, listen
 from core.registry import SkillRegistry
 from core.engine import JarvisEngine
-from gui.app import run_gui as run_gui_app
+from gui.app import run_gui as run_gui_app, set_runtime_status
 
 # Load Env
 load_dotenv()
@@ -17,6 +19,73 @@ if not os.environ.get("GROQ_API_KEY"):
     print("Error: GROQ_API_KEY not found.")
     sys.exit(1)
 
+
+def _contains_wake_word(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    normalized = re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", t)
+    wake_variants = {
+        "jarvis", "jarviss", "jarves", "jervis", "jarvice", "jarvish",
+        "ஜார்விஸ்", "ஜார்விச்", "ஜார் இஸ்", "ஜர்விஸ்",
+    }
+
+    if normalized in {re.sub(r"\s+", "", w.lower()) for w in wake_variants}:
+        return True
+
+    # Token-level fuzzy match for ASR outputs like "jar vise" / "ஜார் இஸ்".
+    tokens = re.findall(r"[a-z0-9\u0B80-\u0BFF]+", t)
+    for token in tokens:
+        token_norm = re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", token.lower())
+        if not token_norm:
+            continue
+        for variant in wake_variants:
+            v = re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", variant.lower())
+            if token_norm == v:
+                return True
+            if difflib.SequenceMatcher(None, token_norm, v).ratio() >= 0.82:
+                return True
+
+    # Phrase-level fallback for spaced variants.
+    for variant in wake_variants:
+        compact_variant = re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", variant.lower())
+        if compact_variant and compact_variant in normalized:
+            return True
+
+    return False
+
+
+def _looks_like_wake_attempt(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    compact = re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", t)
+    if not compact:
+        return False
+
+    # Trigger only for short utterances to avoid accidental activation mid-sentence.
+    word_count = len(re.findall(r"[a-z0-9\u0B80-\u0BFF]+", t))
+    if word_count > 3:
+        return False
+
+    candidates = [
+        "jarvis", "jarviss", "jarves", "jervis", "jarvice", "jaris", "jarvish",
+        "ஜார்விஸ்", "ஜார்விச்", "ஜர்விஸ்",
+    ]
+    compact_candidates = [re.sub(r"[^a-z0-9\u0B80-\u0BFF]+", "", c.lower()) for c in candidates]
+
+    best_ratio = 0.0
+    for cand in compact_candidates:
+        if not cand:
+            continue
+        ratio = difflib.SequenceMatcher(None, compact, cand).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+
+    return best_ratio >= 0.74
+
 def jarvis_loop(pause_event, registry, args):
     """
     Main loop for JARVIS, running in a separate thread.
@@ -24,8 +93,14 @@ def jarvis_loop(pause_event, registry, args):
     """
     # Initialize Engine
     jarvis = JarvisEngine(registry)
+    voice_active = bool(args.text)
 
-    speak("Jarvis Online. Ready for your command.")
+    if args.text:
+        speak("Jarvis Online. Ready for your command.")
+        set_runtime_status("Ready")
+    else:
+        print("JARVIS: Standby mode. Say 'jarvis' to activate.")
+        set_runtime_status("Standby (say jarvis)")
 
     while True:
         # Check for pause
@@ -39,6 +114,7 @@ def jarvis_loop(pause_event, registry, args):
             except EOFError:
                 break
         else:
+            set_runtime_status("Listening...")
             user_query = listen()
             
         # Double check pause after listening (in case paused during listen)
@@ -58,28 +134,26 @@ def jarvis_loop(pause_event, registry, args):
         if args.text:
             clean_query = normalized_query
         else:
-            always_listen = os.environ.get("ALWAYS_LISTEN", "true").lower() in {"1", "true", "yes"}
-            if always_listen:
-                clean_query = normalized_query
-            else:
-                # Wake word / Command filtering Logic (voice mode only)
-                direct_commands = [
-                    "open", "volume", "search", "create", "write", "read", "make", "delete",
-                    "shutdown", "restart", "rename", "move", "copy", "run", "execute",
-                    "brightness", "wifi", "bluetooth",
-                    "who", "what", "when", "where", "how", "why", "thank", "hello"
-                ]
-                
-                is_direct = any(cmd in normalized_query for cmd in direct_commands)
-                
-                if "jarvis" not in normalized_query and not is_direct:
-                    print(f"Ignored: {user_query}")
+            if not voice_active:
+                if not _contains_wake_word(normalized_query) and not _looks_like_wake_attempt(normalized_query):
+                    print(f"Ignored (waiting for wake word): {user_query}")
+                    set_runtime_status("Standby (say jarvis)")
                     continue
-                    
-                clean_query = normalized_query.replace("jarvis", "").strip()
+
+                voice_active = True
+                speak("Jarvis is ready for you.")
+                set_runtime_status("Ready")
+                clean_query = re.sub(r"\bjar\s*vis\b|\bjarvis\b|ஜார்விஸ்|ஜார்\s*இஸ்", "", normalized_query, flags=re.IGNORECASE).strip()
+                if not clean_query:
+                    continue
+            else:
+                clean_query = re.sub(r"\bjar\s*vis\b|\bjarvis\b|ஜார்விஸ்|ஜார்\s*இஸ்", "", normalized_query, flags=re.IGNORECASE).strip()
+                if not clean_query:
+                    continue
         
         try:
             print(f"Thinking: {clean_query}")
+            set_runtime_status("Thinking...")
             response = jarvis.run_conversation(clean_query)
             
             # Check pause before speaking response
@@ -96,11 +170,14 @@ def jarvis_loop(pause_event, registry, args):
 
                 # Always speak, and speak() also prints the same line so user gets text + voice.
                 speak(spoken_response)
+                set_runtime_status("Ready")
             else:
                 speak("I heard you, but I could not generate a response. Please try again.")
+                set_runtime_status("Ready")
         except Exception as e:
             print(f"Main Loop Error: {e}")
             speak("System error. Please try again.")
+            set_runtime_status("Ready")
 
 def main():
     parser = argparse.ArgumentParser(description="JARVIS AI Assistant")
