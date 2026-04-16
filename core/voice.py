@@ -49,6 +49,15 @@ DOT_MARKER_PATTERN = r"(?:dot|point|period|full\s*stop|short|shot|sort|dart)"
 PRIMARY_ASR_LANGUAGE = (os.environ.get("JARVIS_PRIMARY_ASR_LANGUAGE", "en-IN") or "en-IN").strip()
 
 
+def _asr_debug_enabled() -> bool:
+    return os.environ.get("JARVIS_ASR_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def _asr_debug(msg: str) -> None:
+    if _asr_debug_enabled():
+        print(f"[ASR] {msg}")
+
+
 def _env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
     raw = os.environ.get(name)
     try:
@@ -195,13 +204,13 @@ def _is_probable_noise(audio: sr.AudioData) -> bool:
         sample_count = max(1, len(raw) // 2)
         zc = audioop.cross(raw, 2)
         zcr = zc / sample_count
-        max_zcr = _env_float("JARVIS_MAX_ZCR", 0.42, minimum=0.15, maximum=0.8)
+        max_zcr = _env_float("JARVIS_MAX_ZCR", 0.62, minimum=0.20, maximum=0.9)
         rms = audioop.rms(raw, 2)
         if rms <= 0:
             return True
         peak = audioop.max(raw, 2)
         peak_to_rms = peak / max(rms, 1)
-        max_peak_to_rms = _env_float("JARVIS_MAX_PEAK_TO_RMS", 10.0, minimum=3.0, maximum=40.0)
+        max_peak_to_rms = _env_float("JARVIS_MAX_PEAK_TO_RMS", 18.0, minimum=3.0, maximum=45.0)
         return zcr > max_zcr and peak_to_rms > max_peak_to_rms
     except Exception:
         return False
@@ -216,12 +225,19 @@ def _is_low_quality_transcript(transcript: str) -> bool:
     return bool(re.match(r"^(um+|uh+|hmm+|mm+|ah+|ok|okay|yes|yeah|no|hello|hi)$", text))
 
 
-def _candidate_score(text: str, phrase_hints: list[str]) -> float:
+def _candidate_score(text: str, phrase_hints: list[str], confidence: float | None = None) -> float:
     lower = (text or "").lower().strip()
     if not lower:
         return -1.0
 
-    score = 0.2 + (min(len(lower), 120) / 1100.0)
+    conf = float(confidence) if confidence is not None else 0.55
+    score = 0.10 + min(max(conf, 0.0), 1.0) * 0.65
+    score += min(len(lower), 120) / 1100.0
+
+    # Penalize transcripts that look like noisy syllables/repeats.
+    if re.search(r"(.)\1{4,}", lower):
+        score -= 0.18
+
     for keyword, boost in ASR_KEYWORD_BOOST.items():
         if keyword in lower:
             score += boost
@@ -236,59 +252,76 @@ def _candidate_score(text: str, phrase_hints: list[str]) -> float:
     return score
 
 
-def _extract_google_candidates(raw_result) -> list[str]:
+def _extract_google_candidates(raw_result) -> list[tuple[str, float | None]]:
     if not isinstance(raw_result, dict):
         return []
     alternatives = raw_result.get("alternative", [])
     if not alternatives:
         return []
 
-    collected: list[str] = []
+    collected: list[tuple[str, float | None]] = []
     for alt in alternatives:
         transcript = (alt.get("transcript") or "").strip()
         if transcript:
-            collected.append(transcript)
+            confidence = alt.get("confidence")
+            try:
+                confidence_val = float(confidence) if confidence is not None else None
+            except Exception:
+                confidence_val = None
+            collected.append((transcript, confidence_val))
     return collected
 
 
-def _select_best_candidate(candidates: list[str], phrase_hints: list[str]) -> str:
+def _select_best_candidate(candidates: list[tuple[str, float | None]], phrase_hints: list[str]) -> tuple[str, float, float | None]:
     if not candidates:
-        return ""
-    deduped: list[str] = []
+        return "", -1.0, None
+    deduped: list[tuple[str, float | None]] = []
     seen: set[str] = set()
-    for item in candidates:
+    for item, confidence in candidates:
         normalized = item.lower().strip()
         if normalized and normalized not in seen:
             seen.add(normalized)
-            deduped.append(item)
+            deduped.append((item, confidence))
 
     if not deduped:
-        return ""
+        return "", -1.0, None
 
-    best = max(deduped, key=lambda text: _candidate_score(text, phrase_hints))
-    return best
+    best_text, best_confidence = max(
+        deduped,
+        key=lambda pair: _candidate_score(pair[0], phrase_hints, pair[1]),
+    )
+    best_score = _candidate_score(best_text, phrase_hints, best_confidence)
+    return best_text, best_score, best_confidence
 
 
-def _recognize_best_result(recognizer: sr.Recognizer, audio: sr.AudioData, language: str, phrase_hints: list[str]) -> tuple[str, float]:
+def _recognize_best_result(recognizer: sr.Recognizer, audio: sr.AudioData, language: str, phrase_hints: list[str]) -> tuple[str, float, float | None]:
+    _asr_debug(f"Trying language={language}")
     try:
         raw_result = recognizer.recognize_google(audio, show_all=True, language=language)
     except Exception:
-        return "", -1.0
+        raw_result = None
 
     candidates = _extract_google_candidates(raw_result)
     if not candidates:
-        return "", -1.0
+        try:
+            plain = recognizer.recognize_google(audio, language=language)
+            if plain:
+                candidates = [(plain, None)]
+        except Exception:
+            return "", -1.0, None
 
-    best_candidate = _select_best_candidate(candidates, phrase_hints)
+    best_candidate, best_score, best_confidence = _select_best_candidate(candidates, phrase_hints)
     if not best_candidate:
-        return "", -1.0
+        _asr_debug(f"No candidate selected for language={language}")
+        return "", -1.0, None
 
-    return best_candidate, _candidate_score(best_candidate, phrase_hints)
+    _asr_debug(f"Candidate ({language}): {best_candidate} | score={best_score:.3f} conf={best_confidence}")
+    return best_candidate, best_score, best_confidence
 
 
 def _calibrate_ambient_noise(r: sr.Recognizer, source) -> None:
-    rounds = _env_int("JARVIS_NOISE_CALIBRATION_ROUNDS", 3, minimum=1, maximum=6)
-    duration = _env_float("JARVIS_NOISE_SAMPLE_SEC", 1.2, minimum=0.4, maximum=3.0)
+    rounds = _env_int("JARVIS_NOISE_CALIBRATION_ROUNDS", 1, minimum=1, maximum=6)
+    duration = _env_float("JARVIS_NOISE_SAMPLE_SEC", 0.6, minimum=0.25, maximum=3.0)
     thresholds: list[int] = []
     for _ in range(rounds):
         try:
@@ -419,7 +452,7 @@ def _get_asr_language_order() -> list[str]:
     if PRIMARY_ASR_LANGUAGE and PRIMARY_ASR_LANGUAGE in langs:
         ordered.append(PRIMARY_ASR_LANGUAGE)
 
-    for preferred in ("ta-IN", "en-US"):
+    for preferred in ("en-US", "ta-IN"):
         if preferred in langs and preferred not in ordered:
             ordered.append(preferred)
 
@@ -444,6 +477,22 @@ def _detect_text_language(text: str) -> str:
         return "ta"
 
     return "en"
+
+
+def _looks_like_english_command_candidate(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    if not re.search(r"[a-z]", t):
+        return False
+
+    command_words = (
+        "open", "download", "downloads", "folder", "file", "read", "play",
+        "search", "find", "delete", "create", "launch", "desktop", "documents",
+        "music", "video", "picture", "photos", "whatsapp", "youtube",
+    )
+    return any(w in t for w in command_words)
 
 
 def _select_voice_for_language(tts_engine, language: str) -> None:
@@ -617,19 +666,23 @@ def listen():
 
     r = sr.Recognizer()
     r.dynamic_energy_threshold = True
-    r.dynamic_energy_adjustment_damping = 0.10
-    r.dynamic_energy_ratio = 1.35
-    r.energy_threshold = _env_int("JARVIS_ENERGY_THRESHOLD", 260, minimum=120, maximum=1400)
-    r.pause_threshold = 0.45
-    r.phrase_threshold = 0.12
-    r.non_speaking_duration = 0.18
+    r.dynamic_energy_adjustment_damping = 0.18
+    r.dynamic_energy_ratio = 1.15
+    r.energy_threshold = _env_int("JARVIS_ENERGY_THRESHOLD", 210, minimum=80, maximum=1400)
+    r.pause_threshold = 0.70
+    r.phrase_threshold = 0.22
+    r.non_speaking_duration = 0.30
     r.operation_timeout = 10
 
-    mic_sample_rate = _env_int("JARVIS_MIC_SAMPLE_RATE", 16000, minimum=8000, maximum=48000)
-    mic_chunk_size = _env_int("JARVIS_MIC_CHUNK_SIZE", 512, minimum=256, maximum=2048)
+    mic_sample_rate = _env_int("JARVIS_MIC_SAMPLE_RATE", 0, minimum=0, maximum=48000)
+    mic_chunk_size = _env_int("JARVIS_MIC_CHUNK_SIZE", 1024, minimum=256, maximum=4096)
     phrase_hints = _get_phrase_hints()
 
-    with sr.Microphone(sample_rate=mic_sample_rate, chunk_size=mic_chunk_size) as source:
+    mic_kwargs = {"chunk_size": mic_chunk_size}
+    if mic_sample_rate > 0:
+        mic_kwargs["sample_rate"] = mic_sample_rate
+
+    with sr.Microphone(**mic_kwargs) as source:
         print("Listening...")
         _emit_runtime_status("Listening...")
         try:
@@ -639,12 +692,13 @@ def listen():
         except Exception:
             pass
 
-        dynamic_min_rms = max(70, int(r.energy_threshold * 0.45))
+        dynamic_min_rms = max(40, int(r.energy_threshold * 0.25))
 
         # Retry with progressively larger listen windows for noisy/slow speech.
         listen_profiles = [
-            {"timeout": 4, "phrase_time_limit": 8},
-            {"timeout": 6, "phrase_time_limit": 12},
+            {"timeout": 5, "phrase_time_limit": 10},
+            {"timeout": 7, "phrase_time_limit": 14},
+            {"timeout": 9, "phrase_time_limit": 18},
         ]
 
         for profile in listen_profiles:
@@ -660,28 +714,52 @@ def listen():
                 if _is_weak_signal(audio, min_rms_override=dynamic_min_rms):
                     # Skip very low-energy clips to avoid random noisy transcriptions.
                     continue
+
                 if _is_probable_noise(audio):
                     continue
 
                 language_order = _get_asr_language_order()
-                primary_language = language_order[0] if language_order else PRIMARY_ASR_LANGUAGE or "en-IN"
-                best_candidate, best_score = _recognize_best_result(r, audio, primary_language, phrase_hints)
+                _asr_debug(f"Language order: {', '.join(language_order)}")
+                evaluation_languages = list(language_order)
+                if "en" not in evaluation_languages:
+                    evaluation_languages.append("en")
 
-                if best_candidate and not _is_low_quality_transcript(best_candidate) and best_score >= 0.32:
+                best_candidate = ""
+                best_score = -1.0
+                best_language = ""
+                best_en_candidate = ""
+                best_en_score = -1.0
+                best_en_language = ""
+
+                for lang in evaluation_languages:
+                    candidate, score, _conf = _recognize_best_result(r, audio, lang, phrase_hints)
+                    if candidate and score > best_score:
+                        best_candidate = candidate
+                        best_score = score
+                        best_language = lang
+
+                    if lang.lower().startswith("en") and candidate and score > best_en_score:
+                        best_en_candidate = candidate
+                        best_en_score = score
+                        best_en_language = lang
+
+                # Avoid Tamil transliteration false-positives for English file/system commands.
+                if (
+                    best_language.lower().startswith("ta")
+                    and best_en_candidate
+                    and _looks_like_english_command_candidate(best_en_candidate)
+                    and best_en_score >= (best_score - 0.14)
+                ):
+                    _asr_debug(
+                        f"Preferring English command candidate ({best_en_language}) over Tamil fallback"
+                    )
+                    best_candidate = best_en_candidate
+                    best_score = best_en_score
+                    best_language = best_en_language
+
+                if best_candidate and not _is_low_quality_transcript(best_candidate) and best_score >= 0.24:
                     normalized = _normalize_recognition_text(best_candidate)
-                    _learn_from_transcript(normalized, phrase_hints)
-                    _emit_runtime_status("Ready")
-                    return normalized
-
-                fallback_language = language_order[1] if len(language_order) > 1 else None
-                if fallback_language:
-                    fallback_candidate, fallback_score = _recognize_best_result(r, audio, fallback_language, phrase_hints)
-                    if fallback_candidate and fallback_score > best_score:
-                        best_candidate = fallback_candidate
-                        best_score = fallback_score
-
-                if best_candidate and not _is_low_quality_transcript(best_candidate):
-                    normalized = _normalize_recognition_text(best_candidate)
+                    _asr_debug(f"Accepted ({best_language}) score={best_score:.3f}: {normalized}")
                     _learn_from_transcript(normalized, phrase_hints)
                     _emit_runtime_status("Ready")
                     return normalized

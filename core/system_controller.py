@@ -512,27 +512,6 @@ class SystemController:
                 "chatgpt": "https://chat.openai.com",
             }
 
-            # Apps that prefer desktop installation but can fall back to web
-            DESKTOP_FIRST_APPS = {
-                "telegram": {
-                    "paths": [
-                        Path(os.environ.get("APPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
-                        Path(os.environ.get("LOCALAPPDATA", "")) / "Telegram Desktop" / "Telegram.exe",
-                    ],
-                    "web_fallback": "https://web.telegram.org",
-                },
-            }
-
-            if target_lower in DESKTOP_FIRST_APPS or "telegram" in target_lower:
-                # Route to open_application so _open_application can handle desktop-first logic
-                return {
-                    "intent": "open_application",
-                    "action": "open_application",
-                    "status": "success",
-                    "dangerous": False,
-                    "params": {"app_name": "telegram" if "telegram" in target_lower else target},
-                }
-
             # Handle natural commands like "open youtube and play <song>"
             yt_inline_play = re.match(r"^youtube\s+and\s+play\s+(.+)$", target_lower)
             if yt_inline_play:
@@ -559,29 +538,14 @@ class SystemController:
                     "params": {"url": url},
                 }
 
-            app_like_targets = {
-                "telegram", "whatsapp", "spotify", "vlc", "chrome", "edge", "firefox",
-                "notepad", "calculator", "explorer", "word", "excel", "powerpoint",
-                "media player", "windows media player", "code", "vs code", "github desktop",
-            }
-
-            if target_lower in app_like_targets:
-                return {
-                    "intent": "open_application",
-                    "action": "open_application",
-                    "status": "success",
-                    "dangerous": False,
-                    "params": {"app_name": target},
-                }
-
-            # Default to file search for plain names so commands like "open jananayagan" work.
-            if self._looks_like_file_query(target) or target_lower:
+            # File-first behavior for all non-web open commands.
+            if target_lower:
                 return {
                     "intent": "open_file",
                     "action": "open_file",
                     "status": "success",
                     "dangerous": False,
-                    "params": {"query": target, "search_mode": "document"},
+                    "params": {"query": target, "search_mode": "auto"},
                 }
             
             return {
@@ -870,9 +834,26 @@ class SystemController:
     def _open_file(self, query: str, search_mode: str = "auto") -> Dict[str, Any]:
         matches = self._find_files(query, limit=30, search_mode=search_mode)
         if not matches:
+            app_fallback = self._open_application(query)
+            if app_fallback.get("status") == "success":
+                return app_fallback
             return self._response("open_file", "open_file", "failed", f"I could not find {query} on this computer.")
 
         exact_same_name = self._same_name_matches(matches, query)
+        query_has_ext = bool(Path((query or "").strip().lower()).suffix)
+
+        # If query has no extension and we found same-stem variants, prefer a document file directly.
+        if not query_has_ext and len(exact_same_name) > 1:
+            doc_priority = {".pdf": 5, ".docx": 4, ".doc": 3, ".txt": 2, ".rtf": 1}
+            doc_candidates = [p for p in exact_same_name if p.suffix.lower() in doc_priority]
+            if doc_candidates:
+                target = max(doc_candidates, key=lambda p: doc_priority.get(p.suffix.lower(), 0))
+                try:
+                    os.startfile(str(target))
+                    return self._response("open_file", "open_file", "success", f"Opened {target.name}.")
+                except Exception as exc:
+                    return self._response("open_file", "open_file", "failed", f"Found {target.name} but could not open it: {exc}")
+
         if len(exact_same_name) > 1:
             joined = self._format_numbered_paths(exact_same_name)
             self.pending_file_choices = {"matches": exact_same_name, "query": query}
@@ -888,8 +869,32 @@ class SystemController:
         else:
             target = self._pick_best_match(matches, query, search_mode=search_mode)
 
+        normalized_query = self._normalize_media_query(query) or (query or "").strip().lower()
+        stem_lower = target.stem.lower()
+        similarity = difflib.SequenceMatcher(None, normalized_query, stem_lower).ratio() if normalized_query and stem_lower else 0.0
+        token_boundary_match = bool(
+            re.search(rf"(?<![a-z0-9]){re.escape(normalized_query)}(?![a-z0-9])", stem_lower)
+        ) if normalized_query else False
+        strong_filename_match = (
+            normalized_query == stem_lower
+            or (len(normalized_query) >= 4 and token_boundary_match and similarity >= 0.60)
+        )
+
+        # If the filename hit is weak (example: query "chrome" -> file "monochrome.py"),
+        # try opening as an application first.
+        if not strong_filename_match:
+            app_fallback = self._open_application(query)
+            if app_fallback.get("status") == "success":
+                return app_fallback
+
         try:
-            os.startfile(str(target))
+            media_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a"}
+            if search_mode == "media" or target.suffix.lower() in media_exts:
+                opened, err = self._open_media_file(target)
+                if not opened and err:
+                    return self._response("open_file", "open_file", "failed", f"Found {target.name} but could not play it: {err}")
+            else:
+                os.startfile(str(target))
             return self._response("open_file", "open_file", "success", f"Opened {target.name}.")
         except Exception as exc:
             return self._response("open_file", "open_file", "failed", f"Found {target.name} but could not open it: {exc}")
@@ -994,7 +999,18 @@ class SystemController:
 
         target = exact_same_name[0] if len(exact_same_name) == 1 else self._pick_best_match(file_matches, query, search_mode="media")
         try:
-            os.startfile(str(target))
+            media_exts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".m4v", ".webm", ".mp3", ".wav", ".m4a"}
+            if target.suffix.lower() in media_exts:
+                opened, err = self._open_media_file(target)
+                if not opened and err:
+                    return self._response(
+                        "open_file_in_folder",
+                        "open_file_in_folder",
+                        "failed",
+                        f"Found {target.name} in {folder_name}, but could not play it: {err}",
+                    )
+            else:
+                os.startfile(str(target))
             return self._response(
                 "open_file_in_folder",
                 "open_file_in_folder",
@@ -1057,10 +1073,40 @@ class SystemController:
             chosen = max(media_files, key=lambda p: p.stat().st_mtime)
 
         try:
-            os.startfile(str(chosen))
+            opened, err = self._open_media_file(chosen)
+            if not opened and err:
+                return self._response("play_media_in_folder", "play_media_in_folder", "failed", f"I found {chosen.name} but could not play it: {err}")
             return self._response("play_media_in_folder", "play_media_in_folder", "success", f"Playing {chosen.name} from {folder_hint}.")
         except Exception as exc:
             return self._response("play_media_in_folder", "play_media_in_folder", "failed", f"I found {chosen.name} but could not play it: {exc}")
+
+    def _open_media_file(self, path: Path) -> tuple[bool, str | None]:
+        """Open media with VLC when available; fallback to default app."""
+        vlc_candidates: List[str] = []
+        vlc_on_path = shutil.which("vlc")
+        if vlc_on_path:
+            vlc_candidates.append(vlc_on_path)
+
+        for candidate in [
+            Path(os.environ.get("ProgramFiles", "")) / "VideoLAN" / "VLC" / "vlc.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "")) / "VideoLAN" / "VLC" / "vlc.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "VideoLAN" / "VLC" / "vlc.exe",
+        ]:
+            if candidate.exists():
+                vlc_candidates.append(str(candidate))
+
+        for vlc in vlc_candidates:
+            try:
+                subprocess.Popen([vlc, str(path)], shell=False)
+                return True, None
+            except Exception:
+                continue
+
+        try:
+            os.startfile(str(path))
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
 
     def _delete_file(self, filename: str) -> Dict[str, Any]:
         matches = self._find_files(filename, limit=3)
@@ -1231,6 +1277,10 @@ class SystemController:
             Path.home() / "Videos",
             Path.home() / "Music",
             Path.home() / "Pictures",
+            Path.home() / "OneDrive",
+            Path.home() / "OneDrive" / "Desktop",
+            Path.home() / "OneDrive" / "Documents",
+            Path.home() / "OneDrive" / "Downloads",
         ]
 
         if include_drives and self.os_name == "windows":

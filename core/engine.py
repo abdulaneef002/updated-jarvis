@@ -49,10 +49,25 @@ class JarvisEngine:
             return "en"
 
         if re.search(r"[\u0B80-\u0BFF]", q):
+            # ASR can sometimes output Tamil-script transliterations of English commands.
+            tamil_script_english_command_tokens = (
+                "ஓப்பன்", "டவுன்லோட்", "டவுன்லோட", "போல்டர்", "ஃபோல்டர்", "பைல்",
+                "செர்ச்", "ப்ளே", "யூடியூப்", "வாட்ஸ்அப்", "டெஸ்க்டாப்", "டாக்குமெண்ட்ஸ்",
+            )
+            tamil_native_markers = (
+                "எனக்கு", "வேண்டும்", "திற", "காட்டு", "சொல்", "இப்போது", "நேரம்", "வானிலை",
+                "எப்படி", "என்ன", "நன்றி", "வணக்கம்",
+            )
+            has_translit_command = any(token in q for token in tamil_script_english_command_tokens)
+            has_native_tamil = any(token in q for token in tamil_native_markers)
+            if has_translit_command and not has_native_tamil:
+                return "en"
             return "ta"
 
         tamil_romanized_markers = (
-            "vanakkam", "tamizh", "tamil", "ungal", "ennai", "epadi", "enna", "nandri"
+            "vanakkam", "tamizh", "tamil", "ungal", "ennai", "epadi", "enna", "nandri",
+            "nan", "naan", "enakku", "venum", "venuma", "sol", "sollu", "irukku", "illai",
+            "saptiya", "saptingala", "unga", "epdi", "seri", "ponga", "vaanga",
         )
         if any(marker in q for marker in tamil_romanized_markers):
             return "ta"
