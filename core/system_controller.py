@@ -217,6 +217,23 @@ class SystemController:
                 "params": {"query": "movie", "folder_name": folder_name},
             }
 
+        youtube_natural_play = re.match(
+            r"^(?:play|open\s+and\s+play)\s+(.+?)\s+(?:in|on)\s+youtube(?:\s+web)?$",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if youtube_natural_play:
+            query = youtube_natural_play.group(1).strip().strip("\"'")
+            query = re.sub(r"\s+(?:song|music|video)$", "", query, flags=re.IGNORECASE).strip()
+            url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+            return {
+                "intent": "open_website",
+                "action": "open_website",
+                "status": "success",
+                "dangerous": False,
+                "params": {"url": url},
+            }
+
         play_match = re.match(r"^(?:play|open\s+and\s+play)\s+(.+)$", command, flags=re.IGNORECASE)
         if play_match:
             target = play_match.group(1).strip().strip("\"'")
@@ -253,32 +270,41 @@ class SystemController:
                 "params": {"url": url},
             }
 
-        # Conversational quick replies
-        if re.search(r"\b(can\s+you\s+hear\s+me|do\s+you\s+hear\s+me)\b", lowered):
+        # Conversational quick replies - more fuzzy matching
+        if re.search(r"\b(can|could)\s+(you\s+)?hear|do\s+you\s+hear\b", lowered):
             return {
                 "intent": "conversation_reply",
                 "action": "conversation_reply",
                 "status": "success",
                 "dangerous": False,
-                "params": {"message": "Yes, I can hear you clearly."},
+                "params": {"message": "Yes, I can hear you clearly. Please go ahead."},
             }
 
-        if re.search(r"\b(can\s+you\s+speak|do\s+you\s+speak|can\s+you\s+talk|do\s+you\s+talk)\b", lowered):
+        if re.search(r"\b(can|could)\s+(you\s+)?speak|do\s+you\s+(speak|talk)|can\s+you\s+talk\b", lowered):
             return {
                 "intent": "conversation_reply",
                 "action": "conversation_reply",
                 "status": "success",
                 "dangerous": False,
-                "params": {"message": "Yes, I can speak. I am speaking with you now."},
+                "params": {"message": "Yes, I can speak. I am ready to help."},
             }
 
-        if re.search(r"\b(are\s+you\s+there|jarvis\s+are\s+you\s+there)\b", lowered):
+        if re.search(r"\b(are\s+you\s+there|you\s+there|jarvis\s+there)\b", lowered):
             return {
                 "intent": "conversation_reply",
                 "action": "conversation_reply",
                 "status": "success",
                 "dangerous": False,
                 "params": {"message": "Yes, I am here and ready."},
+            }
+
+        if re.search(r"\b(hello|hi|hey)\b", lowered):
+            return {
+                "intent": "conversation_reply",
+                "action": "conversation_reply",
+                "status": "success",
+                "dangerous": False,
+                "params": {"message": "Hello! How can I assist you?"},
             }
 
         learn_correction = re.match(

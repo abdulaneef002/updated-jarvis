@@ -29,18 +29,12 @@ class JarvisEngine:
             language_rule = "Respond in plain conversational English. "
 
         return (
-            f"You are Jarvis, a voice-controlled AI assistant running on Windows. "
-            f"Today's date is {today}. Use this to answer any time-related questions accurately. "
-            "Your responses will be SPOKEN ALOUD by a text-to-speech engine. "
+            f"You are Jarvis, a voice-controlled AI assistant on Windows operating in real-time. "
+            f"Today's date is {today}. "
+            "Respond FAST and SHORT (1-2 sentences max). "
             f"{language_rule}"
-            "NEVER use markdown formatting (no **, ##, -, *, backticks, bullet points). "
-            "Never output JSON in normal responses. "
-            "If the user asks for code, provide short runnable code directly. "
-            "For factual questions, rely on the web context provided to you when available, otherwise answer from your knowledge. "
-            "For 'who is' questions, answer in identity format: '<Name> is <role or description>.' "
-            "After using a tool, give a SHORT spoken confirmation. "
-            "If a tool returns an error, explain it simply in one sentence. "
-            "Keep all responses under 2 sentences. Be natural and conversational like a voice assistant."
+            "No markdown. No JSON in responses. "
+            "Be direct and concise. Speak naturally. Act immediately on commands."
         )
 
     def _detect_user_language(self, text: str) -> str:
@@ -87,14 +81,13 @@ class JarvisEngine:
                     {
                         "role": "system",
                         "content": (
-                            "Translate the given text to spoken Tamil in Tamil script. "
-                            "Keep meaning exact, concise, and do not add extra details. "
-                            "Return only the translated Tamil sentence."
+                            "Translate to Tamil in Tamil script. Keep it short and exact. "
+                            "Return only the Tamil translation, nothing else."
                         ),
                     },
                     {"role": "user", "content": text},
                 ],
-                max_tokens=140,
+                max_tokens=100,
             )
             translated = (response.choices[0].message.content or "").strip()
             return translated or text
@@ -306,7 +299,7 @@ class JarvisEngine:
                     },
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=120,
+                max_tokens=100,
             )
             raw_answer = (response.choices[0].message.content or "").strip() or "I could not find that right now."
             return self._enforce_identity_answer_template(user_prompt, raw_answer)
@@ -548,7 +541,7 @@ class JarvisEngine:
             completion_kwargs = {
                 "model": self.model_name,
                 "messages": messages,
-                "max_tokens": 200
+                "max_tokens": 150
             }
             
             if tools_schema:
@@ -649,11 +642,10 @@ class JarvisEngine:
                 )
             
             # Get final spoken response after tool runs
-            # Remove tools arg for second call or keep it? Usually keep it in case it needs to chain.
-            # But for simplicity let's just complete.
             second_response = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=messages
+                messages=messages,
+                max_tokens=120
             )
             return second_response.choices[0].message.content
         

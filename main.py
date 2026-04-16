@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from core.voice import speak, listen
 from core.registry import SkillRegistry
 from core.engine import JarvisEngine
-from gui.app import run_gui as run_gui_app, set_runtime_status
+from gui.app import run_gui as run_gui_app, set_runtime_status, append_history_line, set_live_heard_text
 
 # Load Env
 load_dotenv()
@@ -48,7 +48,7 @@ def jarvis_loop(pause_event, registry, args):
     while True:
         # Check for pause
         if pause_event.is_set():
-            time.sleep(0.5)
+            time.sleep(0.05)
             continue
 
         if args.text:
@@ -60,13 +60,24 @@ def jarvis_loop(pause_event, registry, args):
             set_runtime_status("Listening...")
             user_query = listen()
             
-        # Double check pause after listening (in case paused during listen)
-        if pause_event.is_set():
+        # If pause was triggered after capture (e.g., push-to-talk release),
+        # still process valid captured speech instead of dropping it.
+        if pause_event.is_set() and (not user_query or user_query.strip().lower() in {"", "none"}):
             continue
 
         normalized_query = user_query.lower().strip()
 
-        if normalized_query == "none" or not normalized_query: continue
+        if normalized_query == "none" or not normalized_query:
+            set_live_heard_text("(did not catch speech)")
+            append_history_line("YOU: (did not catch speech)")
+            continue
+
+        # Always mirror captured user command into Heard line.
+        set_live_heard_text(user_query)
+        
+        print(f"YOU: {user_query}")
+        append_history_line(f"YOU: {user_query}")
+        
         if "quit" in normalized_query: 
             print("Shutting down JARVIS loop...")
             # We can't easily kill the main thread (GUI) from here, 
@@ -83,7 +94,7 @@ def jarvis_loop(pause_event, registry, args):
                 continue
         
         try:
-            print(f"Thinking: {clean_query}")
+            print(f"COMMAND: {clean_query}")
             set_runtime_status("Thinking...")
             response = jarvis.run_conversation(clean_query)
             
@@ -103,21 +114,24 @@ def jarvis_loop(pause_event, registry, args):
 
                 # Always speak, and speak() also prints the same line so user gets text + voice.
                 speak(spoken_response, language=reply_lang)
+                append_history_line(f"JARVIS: {spoken_response}")
                 if not args.text:
-                    speak(_ready_prompt(reply_lang), language=reply_lang)
+                    speak(_ready_prompt(reply_lang), language=reply_lang, update_reply_ui=False)
                 set_runtime_status("Ready")
             else:
                 reply_lang = getattr(jarvis, "last_user_language", "en")
                 speak(_no_response_prompt(reply_lang), language=reply_lang)
+                append_history_line(f"JARVIS: {_no_response_prompt(reply_lang)}")
                 if not args.text:
-                    speak(_ready_prompt(reply_lang), language=reply_lang)
+                    speak(_ready_prompt(reply_lang), language=reply_lang, update_reply_ui=False)
                 set_runtime_status("Ready")
         except Exception as e:
             print(f"Main Loop Error: {e}")
             reply_lang = getattr(jarvis, "last_user_language", "en")
             speak(_error_prompt(reply_lang), language=reply_lang)
+            append_history_line(f"JARVIS: {_error_prompt(reply_lang)}")
             if not args.text:
-                speak(_ready_prompt(reply_lang), language=reply_lang)
+                speak(_ready_prompt(reply_lang), language=reply_lang, update_reply_ui=False)
             set_runtime_status("Ready")
 
 def main():

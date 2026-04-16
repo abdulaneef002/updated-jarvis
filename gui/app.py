@@ -1,7 +1,8 @@
 import sys
 import random
 import math
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel
+import os
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QTextEdit
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QPolygonF, QLinearGradient
 
@@ -210,14 +211,20 @@ class CentralReactor(QWidget):
 
 class JarvisGUI(QMainWindow):
     status_updated = pyqtSignal(str)
+    heard_updated = pyqtSignal(str)
+    reply_updated = pyqtSignal(str)
+    history_appended = pyqtSignal(str)
 
     def __init__(self, pause_event):
         super().__init__()
         self.pause_event = pause_event
         self.is_paused = False
+        self.push_to_talk_enabled = os.environ.get("JARVIS_PUSH_TO_TALK", "false").lower() in {"1", "true", "yes", "on"}
+        self.ptt_active = False
         
         self.setWindowTitle("JARVIS HUD")
         self.resize(1000, 600)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
         # Frameless and Black Background
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -246,7 +253,44 @@ class JarvisGUI(QMainWindow):
         self.right_panel = TelemetryPanel()
         main_layout.addWidget(self.right_panel)
 
-        # Bottom status line for runtime visibility.
+        # Bottom panels for live transcript + history.
+        self.history_box = QTextEdit()
+        self.history_box.setReadOnly(True)
+        self.history_box.setFixedHeight(120)
+        self.history_box.setStyleSheet(
+            "color: #DFFBFF;"
+            "background-color: rgba(0, 10, 12, 190);"
+            "font-size: 13px;"
+            "font-weight: 500;"
+            "border-top: 1px solid #1f1f1f;"
+            "padding: 6px;"
+        )
+        self.history_box.setPlaceholderText("Command History will appear here...")
+
+        self.heard_label = QLabel("Heard: -")
+        self.heard_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.heard_label.setFixedHeight(34)
+        self.heard_label.setStyleSheet(
+            "color: #A7FFF7;"
+            "background-color: rgba(0, 15, 20, 180);"
+            "font-size: 14px;"
+            "font-weight: 500;"
+            "padding-left: 12px;"
+            "border-top: 1px solid #1f1f1f;"
+        )
+
+        self.reply_label = QLabel("Reply: -")
+        self.reply_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.reply_label.setFixedHeight(34)
+        self.reply_label.setStyleSheet(
+            "color: #FFFFFF;"
+            "background-color: rgba(10, 10, 10, 190);"
+            "font-size: 14px;"
+            "font-weight: 500;"
+            "padding-left: 12px;"
+            "border-top: 1px solid #1f1f1f;"
+        )
+
         self.status_label = QLabel("Status: Standby")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setFixedHeight(38)
@@ -260,13 +304,25 @@ class JarvisGUI(QMainWindow):
         )
 
         outer_layout.addLayout(main_layout, stretch=1)
+        outer_layout.addWidget(self.history_box)
+        outer_layout.addWidget(self.heard_label)
+        outer_layout.addWidget(self.reply_label)
         outer_layout.addWidget(self.status_label)
 
         self.status_updated.connect(self._set_status_text)
+        self.heard_updated.connect(self._set_heard_text)
+        self.reply_updated.connect(self._set_reply_text)
+        self.history_appended.connect(self._append_history_line)
+
+        if self.push_to_talk_enabled:
+            self.pause_event.set()
+            self._set_status_text("Push-to-talk: hold SPACE to speak")
         
         # Click listener shortcut (using mousePressEvent on window)
 
     def mousePressEvent(self, event):
+        if self.push_to_talk_enabled:
+            return
         # Toggle Pause
         self.toggle_pause()
         
@@ -285,10 +341,37 @@ class JarvisGUI(QMainWindow):
         # Allow exiting with ESC
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+            return
+
+        if self.push_to_talk_enabled and event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self.ptt_active = True
+            self.pause_event.clear()
+            self._set_status_text("Listening... (push-to-talk)")
+
+    def keyReleaseEvent(self, event):
+        if self.push_to_talk_enabled and event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self.ptt_active = False
+            self.pause_event.set()
+            self._set_status_text("Push-to-talk: hold SPACE to speak")
 
     def _set_status_text(self, status: str):
         text = (status or "").strip() or "Standby"
         self.status_label.setText(f"Status: {text}")
+
+    def _set_heard_text(self, heard: str):
+        text = (heard or "").strip() or "-"
+        self.heard_label.setText(f"Heard: {text}")
+
+    def _set_reply_text(self, reply: str):
+        text = (reply or "").strip() or "-"
+        self.reply_label.setText(f"Reply: {text}")
+
+    def _append_history_line(self, line: str):
+        text = (line or "").strip()
+        if not text:
+            return
+        self.history_box.append(text)
+        self.history_box.verticalScrollBar().setValue(self.history_box.verticalScrollBar().maximum())
 
 
 def set_runtime_status(status: str):
@@ -296,12 +379,32 @@ def set_runtime_status(status: str):
     if _gui_window is not None:
         _gui_window.status_updated.emit(status)
 
+
+def set_live_heard_text(text: str):
+    global _gui_window
+    if _gui_window is not None:
+        _gui_window.heard_updated.emit(text)
+
+
+def set_live_reply_text(text: str):
+    global _gui_window
+    if _gui_window is not None:
+        _gui_window.reply_updated.emit(text)
+
+
+def append_history_line(line: str):
+    global _gui_window
+    if _gui_window is not None:
+        _gui_window.history_appended.emit(line)
+
 def run_gui(pause_event):
     global _gui_window
     app = QApplication(sys.argv)
     window = JarvisGUI(pause_event)
     _gui_window = window
     window.show()
+    window.activateWindow()
+    window.setFocus()
     exit_code = app.exec()
     _gui_window = None
     sys.exit(exit_code)

@@ -19,6 +19,21 @@ ASR_KEYWORD_BOOST = {
     "folder": 0.08,
     "open": 0.05,
     "read": 0.05,
+    "search": 0.05,
+    "whatsapp": 0.14,
+    "youtube": 0.14,
+    "chrome": 0.12,
+    "gmail": 0.10,
+    "desktop": 0.10,
+    "downloads": 0.10,
+    "documents": 0.10,
+    "weather": 0.08,
+    "time": 0.05,
+    "date": 0.05,
+    "jarvis": 0.04,
+    "hear": 0.12,
+    "speak": 0.10,
+    "there": 0.08,
 }
 
 ASR_INTENT_HINTS = (
@@ -32,15 +47,61 @@ ASR_INTENT_HINTS = (
 )
 
 DEFAULT_PHRASE_HINTS = (
+    "jarvis",
+    "open",
+    "search",
+    "can you hear me",
+    "can you hear",
+    "do you hear me",
+    "can you speak",
+    "are you there",
     "pdf",
     "docx",
     "resume",
     "telegram",
     "whatsapp",
+    "open whatsapp",
+    "open whatsapp web",
     "youtube",
+    "play cold storage",
+    "gmail",
+    "chrome",
+    "desktop",
+    "downloads",
+    "documents",
     "vlc",
     "movie",
     "video",
+    "weather",
+    "time",
+    "date",
+)
+
+ASR_STATIC_REPLACEMENTS = (
+    (r"\bwhat's\s*app\b", "whatsapp"),
+    (r"\bwhats\s*app\b", "whatsapp"),
+    (r"\bwhat\s+app\b", "whatsapp"),
+    (r"\bwhat\s*sup\b", "whatsapp"),
+    (r"\bwhatsup\b", "whatsapp"),
+    (r"\bwatch\s*app\b", "whatsapp"),
+    (r"\bwhat\s+aap\b", "whatsapp"),
+    (r"\byou\s*tube\b", "youtube"),
+    (r"\bdesk\s*top\b", "desktop"),
+    (r"\bdown\s*load(?:s)?\b", "downloads"),
+    (r"\bmy\s+down\s*load(?:s)?\b", "downloads"),
+    (r"\bgoogle\s+chrome\b", "chrome"),
+    (r"\bchat\s*gpt\b", "chatgpt"),
+    (r"\bjar\s*vis\b", "jarvis"),
+    (r"\bcan\s+you\s+year\b", "can you hear"),
+    (r"\bdo\s+you\s+year\b", "do you hear"),
+    (r"\byou\s+hear\s+me\b", "can you hear me"),
+    (r"\bcan\s+u\s+hear\b", "can you hear"),
+    (r"\bare\s+u\s+there\b", "are you there"),
+    (r"\bcan\s+you\s+spik\b", "can you speak"),
+    (r"\bcold\s+storange\b", "cold storage"),
+    (r"\bcall\s+storage\b", "cold storage"),
+    (r"\bcoat\s+storage\b", "cold storage"),
+    (r"\bcode\s+storage\b", "cold storage"),
 )
 
 ASR_ADAPTATION_FILENAME = "asr_adaptation.json"
@@ -191,27 +252,41 @@ def _is_weak_signal(audio: sr.AudioData, min_rms_override: int | None = None) ->
     try:
         sample_width = getattr(audio, "sample_width", 2)
         rms = audioop.rms(audio.frame_data, sample_width)
-        min_rms = min_rms_override if min_rms_override is not None else _env_int("JARVIS_MIN_RMS", 90, minimum=20, maximum=5000)
+        min_rms = min_rms_override if min_rms_override is not None else _env_int("JARVIS_MIN_RMS", 35, minimum=15, maximum=5000)
         return rms < min_rms
     except Exception:
         return False
 
 
 def _is_probable_noise(audio: sr.AudioData) -> bool:
-    """Reject clips with extreme zero-crossing ratio that often indicates hiss/static."""
+    """Reject clips with extreme zero-crossing ratio or hiss patterns that indicate crowd noise."""
     try:
+        if os.environ.get("JARVIS_ENABLE_NOISE_GATE", "false").lower() not in {"1", "true", "yes", "on"}:
+            return False
         raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
         sample_count = max(1, len(raw) // 2)
         zc = audioop.cross(raw, 2)
         zcr = zc / sample_count
-        max_zcr = _env_float("JARVIS_MAX_ZCR", 0.62, minimum=0.20, maximum=0.9)
+        max_zcr = _env_float("JARVIS_MAX_ZCR", 0.72, minimum=0.20, maximum=0.9)
         rms = audioop.rms(raw, 2)
         if rms <= 0:
             return True
         peak = audioop.max(raw, 2)
         peak_to_rms = peak / max(rms, 1)
         max_peak_to_rms = _env_float("JARVIS_MAX_PEAK_TO_RMS", 18.0, minimum=3.0, maximum=45.0)
-        return zcr > max_zcr and peak_to_rms > max_peak_to_rms
+        is_noise = zcr > max_zcr and peak_to_rms > max_peak_to_rms
+        if is_noise:
+            return True
+        strict_noise = os.environ.get("JARVIS_STRICT_NOISE_FILTER", "false").lower() in {"1", "true", "yes", "on"}
+        if strict_noise and len(raw) >= 4:
+            diff_energy = 0
+            sample_pairs = min(500, (len(raw) - 2) // 2)
+            for i in range(sample_pairs):
+                idx = i * 2
+                diff_energy += abs(int.from_bytes(raw[idx:idx+2], 'little', signed=True) - int.from_bytes(raw[idx+2:idx+4], 'little', signed=True))
+            if sample_pairs > 0 and diff_energy / sample_pairs > 5000:
+                return True
+        return False
     except Exception:
         return False
 
@@ -222,6 +297,10 @@ def _is_low_quality_transcript(transcript: str) -> bool:
         return True
     if len(text) <= 2:
         return True
+    if len(text.split()) == 1 and len(text) < 8:
+        return True
+    if re.search(r"(.)\1{4,}", text):
+        return True
     return bool(re.match(r"^(um+|uh+|hmm+|mm+|ah+|ok|okay|yes|yeah|no|hello|hi)$", text))
 
 
@@ -230,25 +309,25 @@ def _candidate_score(text: str, phrase_hints: list[str], confidence: float | Non
     if not lower:
         return -1.0
 
-    conf = float(confidence) if confidence is not None else 0.55
-    score = 0.10 + min(max(conf, 0.0), 1.0) * 0.65
+    conf = float(confidence) if confidence is not None else 0.48
+    score = 0.05 + min(max(conf, 0.0), 1.0) * 0.62
     score += min(len(lower), 120) / 1100.0
 
     # Penalize transcripts that look like noisy syllables/repeats.
-    if re.search(r"(.)\1{4,}", lower):
-        score -= 0.18
+    if re.search(r"(.)\.1{4,}", lower):
+        score -= 0.10
 
     for keyword, boost in ASR_KEYWORD_BOOST.items():
         if keyword in lower:
-            score += boost
+            score += boost * 1.25
 
     for hint in phrase_hints:
         if hint and hint in lower:
-            score += 0.10
+            score += 0.14
 
     # Prefer transcriptions with meaningful words over tiny fragments.
     word_count = len([w for w in lower.split() if w])
-    score += min(word_count, 12) * 0.03
+    score += min(word_count, 12) * 0.04
     return score
 
 
@@ -319,9 +398,17 @@ def _recognize_best_result(recognizer: sr.Recognizer, audio: sr.AudioData, langu
     return best_candidate, best_score, best_confidence
 
 
+def _quick_recognize_text(recognizer: sr.Recognizer, audio: sr.AudioData, language: str) -> str:
+    """Fast single-pass recognition used to update UI quickly for short commands."""
+    try:
+        return (recognizer.recognize_google(audio, language=language) or "").strip()
+    except Exception:
+        return ""
+
+
 def _calibrate_ambient_noise(r: sr.Recognizer, source) -> None:
-    rounds = _env_int("JARVIS_NOISE_CALIBRATION_ROUNDS", 1, minimum=1, maximum=6)
-    duration = _env_float("JARVIS_NOISE_SAMPLE_SEC", 0.6, minimum=0.25, maximum=3.0)
+    rounds = _env_int("JARVIS_NOISE_CALIBRATION_ROUNDS", 2, minimum=1, maximum=6)
+    duration = _env_float("JARVIS_NOISE_SAMPLE_SEC", 0.4, minimum=0.25, maximum=3.0)
     thresholds: list[int] = []
     for _ in range(rounds):
         try:
@@ -333,7 +420,7 @@ def _calibrate_ambient_noise(r: sr.Recognizer, source) -> None:
     if thresholds:
         thresholds.sort()
         median = thresholds[len(thresholds) // 2]
-        r.energy_threshold = min(1200, max(100, int(median * 1.1)))
+        r.energy_threshold = min(1000, max(80, int(median * 0.9)))
 
 def init_engine():
     global engine
@@ -403,6 +490,9 @@ def _normalize_recognition_text(text: str) -> str:
 
     normalized = text.lower().strip()
 
+    for pattern, replacement in ASR_STATIC_REPLACEMENTS:
+        normalized = re.sub(pattern, replacement, normalized)
+
     # Convert spaced spelling to canonical forms.
     normalized = re.sub(r"\bp\s*d\s*f\b", "pdf", normalized)
     normalized = re.sub(r"\bdoc\s*x\b", "docx", normalized)
@@ -441,9 +531,9 @@ def _normalize_recognition_text(text: str) -> str:
 
 
 def _get_asr_languages() -> list[str]:
-    raw = os.environ.get("JARVIS_ASR_LANGUAGES", "en-IN,en-US,ta-IN")
+    raw = os.environ.get("JARVIS_ASR_LANGUAGES", "en-IN,en-US,en-GB,ta-IN")
     langs = [x.strip() for x in raw.split(",") if x.strip()]
-    return langs or ["en-IN", "en-US", "ta-IN"]
+    return langs or ["en-IN", "en-US", "en-GB", "ta-IN"]
 
 
 def _get_asr_language_order() -> list[str]:
@@ -594,13 +684,42 @@ def _emit_runtime_status(status: str) -> None:
         pass
 
 
-def speak(text, language: str | None = None):
+def _emit_user_heard(text: str) -> None:
+    try:
+        from gui.app import set_live_heard_text
+        set_live_heard_text(text)
+    except Exception:
+        pass
+
+
+def _emit_assistant_reply(text: str) -> None:
+    try:
+        from gui.app import set_live_reply_text
+        set_live_reply_text(text)
+    except Exception:
+        pass
+
+
+def _looks_like_actionable_command(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    command_starters = (
+        "open", "play", "launch", "search", "find", "read", "create", "delete",
+        "rename", "move", "copy", "send", "whatsapp", "youtube",
+    )
+    return any(t.startswith(prefix + " ") or t == prefix for prefix in command_starters)
+
+
+def speak(text, language: str | None = None, update_reply_ui: bool = True):
     global is_speaking
     text = _clean_for_speech(text)
     lang = language or _detect_text_language(text)
 
     # Print first so user sees it even if audio fails
     print(f"JARVIS: {text}")
+    if update_reply_ui:
+        _emit_assistant_reply(text)
     _emit_runtime_status("Speaking...")
 
     # Set flag to True before speaking
@@ -666,12 +785,12 @@ def listen():
 
     r = sr.Recognizer()
     r.dynamic_energy_threshold = True
-    r.dynamic_energy_adjustment_damping = 0.18
-    r.dynamic_energy_ratio = 1.15
-    r.energy_threshold = _env_int("JARVIS_ENERGY_THRESHOLD", 210, minimum=80, maximum=1400)
-    r.pause_threshold = 0.70
-    r.phrase_threshold = 0.22
-    r.non_speaking_duration = 0.30
+    r.dynamic_energy_adjustment_damping = 0.21
+    r.dynamic_energy_ratio = 1.30
+    r.energy_threshold = _env_int("JARVIS_ENERGY_THRESHOLD", 170, minimum=50, maximum=1400)
+    r.pause_threshold = 0.55
+    r.phrase_threshold = 0.17
+    r.non_speaking_duration = 0.20
     r.operation_timeout = 10
 
     mic_sample_rate = _env_int("JARVIS_MIC_SAMPLE_RATE", 0, minimum=0, maximum=48000)
@@ -692,14 +811,23 @@ def listen():
         except Exception:
             pass
 
-        dynamic_min_rms = max(40, int(r.energy_threshold * 0.25))
+        # Avoid scaling too high in noisy rooms; otherwise normal speech is rejected as "weak".
+        dynamic_min_rms = min(95, max(22, int(r.energy_threshold * 0.12)))
 
-        # Retry with progressively larger listen windows for noisy/slow speech.
+        # Retry with balanced listen windows: fast but capture full speech.
         listen_profiles = [
-            {"timeout": 5, "phrase_time_limit": 10},
-            {"timeout": 7, "phrase_time_limit": 14},
-            {"timeout": 9, "phrase_time_limit": 18},
+            {"timeout": 2, "phrase_time_limit": 5},
+            {"timeout": 4, "phrase_time_limit": 8},
+            {"timeout": 6, "phrase_time_limit": 12},
         ]
+
+        min_accept_score = _env_float("JARVIS_MIN_ACCEPT_SCORE", 0.19, minimum=0.10, maximum=0.70)
+        min_fallback_score = _env_float("JARVIS_MIN_FALLBACK_SCORE", 0.14, minimum=0.08, maximum=0.60)
+        best_overall_candidate = ""
+        best_overall_normalized = ""
+        best_overall_score = -1.0
+        best_overall_language = ""
+        best_quick_normalized = ""
 
         for profile in listen_profiles:
             try:
@@ -713,13 +841,34 @@ def listen():
 
                 if _is_weak_signal(audio, min_rms_override=dynamic_min_rms):
                     # Skip very low-energy clips to avoid random noisy transcriptions.
+                    print("[ASR] Heard mostly weak audio, retrying...")
                     continue
 
                 if _is_probable_noise(audio):
+                    print("[ASR] Background noise too strong, retrying...")
                     continue
 
                 language_order = _get_asr_language_order()
                 _asr_debug(f"Language order: {', '.join(language_order)}")
+
+                # Ultra-fast preview so recognized text appears on screen as early as possible.
+                primary_lang = language_order[0] if language_order else "en-IN"
+                quick_text = _quick_recognize_text(r, audio, primary_lang)
+                if quick_text:
+                    quick_normalized = _normalize_recognition_text(quick_text)
+                    best_quick_normalized = quick_normalized
+                    _emit_user_heard(quick_normalized)
+                    print(f"[ASR] Quick heard: \"{quick_normalized}\" (lang={primary_lang})")
+                    # Fast accept short actionable commands to reduce command-to-text delay.
+                    if (
+                        not _is_low_quality_transcript(quick_text)
+                        and _looks_like_actionable_command(quick_normalized)
+                        and len(quick_normalized.split()) <= 6
+                    ):
+                        _learn_from_transcript(quick_normalized, phrase_hints)
+                        _emit_runtime_status("Ready")
+                        return quick_normalized
+
                 evaluation_languages = list(language_order)
                 if "en" not in evaluation_languages:
                     evaluation_languages.append("en")
@@ -757,34 +906,81 @@ def listen():
                     best_score = best_en_score
                     best_language = best_en_language
 
-                if best_candidate and not _is_low_quality_transcript(best_candidate) and best_score >= 0.24:
+                if best_candidate:
                     normalized = _normalize_recognition_text(best_candidate)
-                    _asr_debug(f"Accepted ({best_language}) score={best_score:.3f}: {normalized}")
-                    _learn_from_transcript(normalized, phrase_hints)
-                    _emit_runtime_status("Ready")
-                    return normalized
+                    print(f"[ASR] I heard: \"{normalized}\" (score={best_score:.3f}, lang={best_language})")
+                    _emit_user_heard(normalized)
 
-                # Optional offline fallback when PocketSphinx is installed.
-                if os.environ.get("JARVIS_ENABLE_SPHINX_FALLBACK", "false").lower() in {"1", "true", "yes"}:
-                    try:
-                        offline = r.recognize_sphinx(audio)
-                        if offline:
-                            normalized = _normalize_recognition_text(offline)
-                            _learn_from_transcript(normalized, phrase_hints)
-                            _emit_runtime_status("Ready")
-                            return normalized
-                    except Exception:
-                        pass
+                    if not _is_low_quality_transcript(best_candidate) and best_score > best_overall_score:
+                        best_overall_candidate = best_candidate
+                        best_overall_normalized = normalized
+                        best_overall_score = best_score
+                        best_overall_language = best_language
+
+                    if not _is_low_quality_transcript(best_candidate) and best_score >= min_accept_score:
+                        _asr_debug(f"Accepted ({best_language}) score={best_score:.3f}: {normalized}")
+                        _learn_from_transcript(normalized, phrase_hints)
+                        _emit_runtime_status("Ready")
+                        return normalized
+
+                    # Fast-path acceptance: if it clearly looks like a command, don't over-wait.
+                    if (
+                        not _is_low_quality_transcript(best_candidate)
+                        and _looks_like_actionable_command(normalized)
+                        and best_score >= min_fallback_score
+                    ):
+                        _asr_debug(f"Accepted fast-path ({best_language}) score={best_score:.3f}: {normalized}")
+                        _learn_from_transcript(normalized, phrase_hints)
+                        _emit_runtime_status("Ready")
+                        return normalized
+
+                # Skip offline fallback for speed in real-time environments
 
             except sr.UnknownValueError:
+                print(f"[ASR] Retry {listen_profiles.index(profile) + 1}/3: Could not understand audio (score too low)")
                 # Reduce threshold slightly after misses to catch softer speech.
                 r.energy_threshold = max(120, int(r.energy_threshold * 0.9))
                 continue
             except sr.WaitTimeoutError:
+                print(f"[ASR] Retry {listen_profiles.index(profile) + 1}/3: Timeout waiting for speech")
                 continue
             except sr.RequestError:
+                print(f"[ASR] Retry {listen_profiles.index(profile) + 1}/3: API request failed")
                 continue
             except Exception:
                 continue
+
+        if best_overall_normalized and best_overall_score >= min_fallback_score:
+            print(
+                f"[ASR] Using best match: \"{best_overall_normalized}\" "
+                f"(score={best_overall_score:.3f}, lang={best_overall_language})"
+            )
+            _learn_from_transcript(best_overall_normalized, phrase_hints)
+            _emit_runtime_status("Ready")
+            return best_overall_normalized
+
+        if best_quick_normalized and _looks_like_actionable_command(best_quick_normalized):
+            print(f"[ASR] Using quick fallback: \"{best_quick_normalized}\"")
+            _learn_from_transcript(best_quick_normalized, phrase_hints)
+            _emit_runtime_status("Ready")
+            return best_quick_normalized
+
+        # Final resilient attempt: do one plain recognition pass before giving up.
+        try:
+            rescue_language = _get_asr_language_order()[0]
+        except Exception:
+            rescue_language = "en-IN"
+
+        try:
+            # Use the last captured audio clip from loop scope when available.
+            if 'audio' in locals() and audio is not None:
+                rescue_text = (r.recognize_google(audio, language=rescue_language) or "").strip()
+                if rescue_text:
+                    rescue_normalized = _normalize_recognition_text(rescue_text)
+                    _emit_user_heard(rescue_normalized)
+                    _emit_runtime_status("Ready")
+                    return rescue_normalized
+        except Exception:
+            pass
 
         return "none"
